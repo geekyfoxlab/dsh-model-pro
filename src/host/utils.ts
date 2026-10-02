@@ -65,6 +65,18 @@ async function writeOwnedKey(st: SettingsService, key: string, value: unknown): 
   ownedStates.set(st, { ...(isRecord(descriptor.value.state) ? descriptor.value.state : {}), [key]: value })
 }
 
+/** 能力来源只读取插件自己的状态，不与原生供应商的同名键合并。 */
+export function readOwnedStateKey(st: SettingsService, key: string): unknown {
+  if (typeof st.get === 'function') return st.get(NS)?.[key]
+  const state = st.describe?.().find((row) => row.ns === PACKAGE)?.value.state
+  return isRecord(state) ? state[key] : undefined
+}
+
+export async function writeOwnedStateKey(st: SettingsService, key: string, value: unknown): Promise<void> {
+  if (typeof st.get !== 'function') return writeOwnedKey(st, key, value)
+  return writeRoutesRootKey(st, key, value)
+}
+
 /** 插件卸载时只还原适配器；保留插件档案中的备份，供重装恢复禁用状态。 */
 export async function restoreModernProviders(st: SettingsService, providers: Record<string, ProviderProfile>): Promise<void> {
   const descriptor = requireDescriptor(st, NS)

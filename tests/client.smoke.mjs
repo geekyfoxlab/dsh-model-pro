@@ -137,17 +137,17 @@ const testProviders = [
 // ---------------------------------------------------------------------------
 const uiPrefsState = { showRouteBadge: true }
 let modelState = [
-  { id: 'deepseek-chat', input: ['text'], requestModel: 'wire-chat' },
-  { id: 'known-image-model', input: ['text', 'image'], capabilitySource: 'catalog' },
+  { id: 'deepseek-v4.1-flash', name: 'Legacy model', contextWindow: 128000, maxTokens: 4096, input: ['text'], requestModel: 'wire-chat', capabilitySource: 'configured' },
+  { id: 'known-image-model', input: ['text', 'image'], capabilitySource: 'catalog', capabilityConflict: true, capabilityReference: 'Synthetic catalog reference' },
   { id: 'custom-vision-name' },
 ]
 const discoveredState = [
   { id: 'remote-text', name: 'Remote text', input: ['text'] },
-  { id: 'remote-image', name: 'Remote image', input: ['text', 'image'] },
+  { id: 'remote-image', name: 'Remote image', input: ['text', 'image'], capabilitySource: 'discovery' },
   { id: 'unknown-vision', name: 'Unknown vision' },
 ]
 const remoteCalls = []
-let identifySummary = { image: 1, text: 1, unknown: 1, preserved: 1, updated: 1, catalogUnavailable: false }
+let identifySummary = { image: 1, text: 1, unknown: 1, preserved: 1, updated: 1, rechecked: 2, conflicts: 1, catalogUnavailable: false }
 let identifyError = ''
 let providerRefreshError = ''
 const businessFor = (method, payload) => {
@@ -164,9 +164,19 @@ const businessFor = (method, payload) => {
       ? { ok: false, error: identifyError }
       : { ok: true, count: modelState.length, ...(identifySummary ? { capabilitySummary: { ...identifySummary } } : {}) }
     const incoming = (payload.models || []).map((m) => {
-      const entry = { ...m }
+      // Model updates are partial. Keep fields omitted by an ordinary save;
+      // only the explicit UI mutation intent changes this mock's manual state.
+      const previous = payload.mode === 'merge' ? modelState.find((entry) => entry.id === m.id) : undefined
+      const entry = { ...previous, ...m }
       if (entry.input === null) delete entry.input
       if (entry.requestModel === null) delete entry.requestModel
+      if (m.inputMode === 'manual' || m.inputMode === 'auto') {
+        delete entry.capabilitySource
+        delete entry.capabilityConflict
+        delete entry.capabilityReference
+      }
+      if (m.inputMode === 'manual') entry.capabilitySource = 'manual'
+      delete entry.inputMode
       return entry
     })
     if (payload.mode === 'replace') modelState = incoming
@@ -211,7 +221,7 @@ const structures = []
 const fake = new FakeReact()
 const slotsByName = new Map()
 let registeredLocale = null
-const translatedKeys = new Set(['statusCapabilities', 'statusCapabilitiesCurrent', 'capabilitiesUnconfirmed', 'capabilityCatalogUnavailable', 'inputCapabilityHint'])
+const translatedKeys = new Set(['statusCapabilities', 'statusCapabilitiesCurrent', 'capabilitiesUnconfirmed', 'capabilityCatalogUnavailable', 'inputCapabilityHint', 'capabilitySourceConfigured', 'capabilitySourceManual', 'capabilitySourceCatalog', 'capabilitySourceOfficial', 'capabilitySourceProviderDefault', 'capabilitySourceDiscovery', 'capabilitySourceUnknown', 'capabilityReferenceLabel', 'capabilityConflictHint'])
 
 const ctx = {
   get: (name) => {
@@ -395,6 +405,10 @@ assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputTextOnly'), '
 assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputTextImage'), 'known image models have an image-capability badge')
 assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputUnknown'), 'missing capability is unconfirmed, not text-only')
 assert(formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name')?.props.value === 'auto', 'vision-like names without metadata stay automatic/unconfirmed')
+assert(formControl(modelNodes, 'select', 'inputCapabilityCol: deepseek-v4.1-flash')?.props.value === 'auto', 'old configured text is not mistaken for a manual selection')
+assert(formControl(modelNodes, 'select', 'inputCapabilityCol: known-image-model')?.props.value === 'auto', 'catalog image capability stays in automatic mode')
+assert(modelNodes.some((n) => n.text === 'Old configuration (unknown source)') && modelNodes.some((n) => n.text === 'Model catalog'), 'model rows explain legacy and catalog capability sources')
+assert(modelNodes.some((n) => n.text.includes('Catalog labels differ')) && modelNodes.some((n) => n.text.includes('Synthetic catalog reference')), 'model rows display conflict and reference metadata')
 
 // Manual capability is carried in the saved model, and automatic reset has an
 // explicit null rather than disappearing during JSON serialization.
@@ -406,47 +420,59 @@ buttonByText(modelNodes, 'saveModelConfig').onClick()
 await settle()
 assert(JSON.stringify(lastApply().payload.models.find((m) => m.id === 'custom-vision-name').input) === JSON.stringify(['text', 'image']), 'manual image support is sent to apply-models')
 assert(JSON.stringify(lastApply().payload.models.find((m) => m.id === 'known-image-model').input) === JSON.stringify(['text']), 'manual text-only support is sent to apply-models')
-assert(!Object.hasOwn(lastApply().payload.models.find((m) => m.id === 'known-image-model'), 'capabilitySource'), 'manual capability edits do not retain automatic detection source')
+assert(lastApply().payload.models.find((m) => m.id === 'known-image-model').inputMode === 'manual' && lastApply().payload.models.find((m) => m.id === 'custom-vision-name').inputMode === 'manual', 'manual choices include explicit mutation intent')
+assert(lastApply().payload.models.every((m) => !Object.keys(m).some((key) => key.startsWith('capability'))), 'saving model configuration strips all display-only capability metadata')
+assert(!Object.hasOwn(lastApply().payload.models.find((m) => m.id === 'deepseek-v4.1-flash'), 'input'), 'saving other fields does not resend the legacy capability as a manual choice')
+const untouched = lastApply().payload.models.find((m) => m.id === 'deepseek-v4.1-flash')
+assert(untouched.name === 'Legacy model' && untouched.contextWindow === 128000 && untouched.maxTokens === 4096 && untouched.requestModel === 'wire-chat', 'ordinary save retains model names, limits and wire mapping')
 modelNodes = renderModels()
+assert(formControl(modelNodes, 'select', 'inputCapabilityCol: known-image-model')?.props.value === 'text' && formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name')?.props.value === 'image', 'only confirmed manual sources select manual capability options')
+assert(modelNodes.some((n) => n.text === 'Set manually in this plugin'), 'manual source is visible')
 formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name').onChange({ target: { value: 'auto' } })
 modelNodes = renderModels()
 buttonByText(modelNodes, 'saveModelConfig').onClick()
 await settle()
 assert(lastApply().payload.models.find((m) => m.id === 'custom-vision-name').input === null, 'automatic reset sends input:null')
+assert(lastApply().payload.models.find((m) => m.id === 'custom-vision-name').inputMode === 'auto', 'automatic reset explicitly releases the manual selection')
 
 // Clearing the last wire mapping must leave a reachable save action.
 modelNodes = renderModels()
-formControl(modelNodes, 'input', 'reqModelField: deepseek-chat').onChange({ target: { value: '' } })
+formControl(modelNodes, 'input', 'reqModelField: deepseek-v4.1-flash').onChange({ target: { value: '' } })
 modelNodes = renderModels()
 assert(buttonByText(modelNodes, 'saveModelConfig'), 'save action remains available after clearing the last mapping')
 assert(buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'capability backfill waits for an unsaved mapping change')
 buttonByText(modelNodes, 'saveModelConfig').onClick()
 await settle()
-assert(lastApply().payload.models.find((m) => m.id === 'deepseek-chat').requestModel === null, 'clearing a mapping sends requestModel:null')
+assert(lastApply().payload.models.find((m) => m.id === 'deepseek-v4.1-flash').requestModel === null, 'clearing a mapping sends requestModel:null')
+assert(lastApply().payload.models.every((m) => !Object.hasOwn(m, 'input') && !Object.hasOwn(m, 'inputMode')), 'mapping-only save cannot turn any displayed capability into a manual override')
 
 // Identification sends only IDs so displayed/inferred capabilities cannot be
 // mistaken for manual choices. Counts come from the authoritative host result.
-modelState = modelState.map((m) => m.id === 'known-image-model' ? { ...m, input: ['text', 'image'] } : m)
+modelState = modelState.map((m) => m.id === 'deepseek-v4.1-flash' ? { ...m, input: ['text', 'image'], capabilitySource: 'official', capabilityReference: 'Synthetic official model reference', capabilityConflict: true } : m)
 modelNodes = renderModels()
 buttonByText(modelNodes, 'identifyCapabilities').onClick()
 assert(buttonByText(renderModels(), 'identifyCapabilities').props.disabled, 'identify button is disabled while the request is in flight')
 await settle()
 assert(lastApply().payload.mode === 'identify' && lastApply().payload.models.length === 3, 'detect-and-save invokes the dedicated identify mode')
+assert(lastApply().payload.recheckLegacy === true, 're-identification explicitly requests legacy and automatic capability review')
 assert(lastApply().payload.route === 'deepseek' && lastApply().payload.models.every((m) => Object.keys(m).length === 1 && typeof m.id === 'string'), 'identify payload contains only the current model IDs')
 modelNodes = renderModels()
 const inlineStatus = (nodes) => nodes.find((n) => n.className.includes('mpro-inlineStatus'))
-assert(inlineStatus(modelNodes)?.text.includes('1 text + image, 1 text only, 1 unconfirmed') && inlineStatus(modelNodes).text.includes('Kept 1 existing settings; updated 1 models'), 'identify reports image, text, unknown, preserved and updated counts')
+assert(inlineStatus(modelNodes)?.text.includes('1 text + image, 1 text only, 1 unconfirmed') && inlineStatus(modelNodes).text.includes('Kept 1 existing settings; rechecked 2 models; updated 1 models; conflicting catalog labels: 1'), 'identify reports capability, existing-setting preservation, rechecked, updated and conflict counts')
+assert(modelNodes.some((n) => n.text === 'Official model reference (endpoint untested)') && modelNodes.some((n) => n.text.includes('Synthetic official model reference')), 'official metadata is visible without claiming an endpoint test')
+assert(formControl(modelNodes, 'select', 'inputCapabilityCol: deepseek-v4.1-flash')?.props.value === 'auto', 'official image metadata remains automatic after re-identification')
 assert(inlineStatus(modelNodes).text.includes('Set unconfirmed input capabilities manually'), 'unknown models receive a manual-setting explanation')
 assert(!buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'identify button restores enabled state after success')
 assert(modelNodes.some((n) => n.text.includes('does not send an image test request')), 'catalog identification is distinguished from a real image test')
 
 // A successful write with zero recognized models must describe that outcome.
 identifySummary = { image: 0, text: 0, unknown: 3, preserved: 0, updated: 0, catalogUnavailable: false }
-modelState = modelState.map(({ input: _input, ...m }) => m)
+modelState = modelState.map(({ input: _input, capabilitySource: _source, capabilityConflict: _conflict, capabilityReference: _reference, ...m }) => m)
 buttonByText(modelNodes, 'identifyCapabilities').onClick()
 await settle()
 modelNodes = renderModels()
 assert(inlineStatus(modelNodes)?.text.includes('0 text + image, 0 text only, 3 unconfirmed') && inlineStatus(modelNodes).text.includes('updated 0 models'), 'all-unknown zero-update outcome is visible rather than a generic total model count')
+assert(inlineStatus(modelNodes).text.includes('rechecked 0 models') && inlineStatus(modelNodes).text.includes('conflicting catalog labels: 0'), 'older summaries without new fields display zero rather than undefined')
 
 identifySummary = { ...identifySummary, catalogUnavailable: true }
 buttonByText(modelNodes, 'identifyCapabilities').onClick()
@@ -476,7 +502,7 @@ providerRefreshError = ''
 // Hosts without an identification summary can still show the freshly read
 // current capabilities, without inventing update counts or a live-test verdict.
 identifySummary = null
-modelState = modelState.map((m) => m.id === 'deepseek-chat' ? { ...m, input: ['text'] } : m.id === 'known-image-model' ? { ...m, input: ['text', 'image'] } : m)
+modelState = modelState.map((m) => m.id === 'deepseek-v4.1-flash' ? { ...m, input: ['text'] } : m.id === 'known-image-model' ? { ...m, input: ['text', 'image'] } : m)
 buttonByText(modelNodes, 'identifyCapabilities').onClick()
 await settle()
 modelNodes = renderModels()
@@ -490,6 +516,7 @@ modelNodes = renderModels()
 const remoteUnknown = modelNodes.find((n) => n.tag === 'tr' && n.text.includes('unknown-vision'))
 assert(remoteUnknown?.text.includes('inputUnknown') && !remoteUnknown.text.includes('inputTextOnly'), 'discovery does not infer capability from a vision-like name')
 assert(modelNodes.some((n) => n.tag === 'tr' && n.text.includes('remote-image') && n.text.includes('inputTextImage')), 'discovery displays known image capability')
+assert(modelNodes.some((n) => n.text === 'Provider metadata'), 'discovery explains provider metadata capability sources')
 // open the add-model form and assert its fields + submit button render
 const addToggle = outM.find((n) => n.tag === 'button' && /addModelToggle|addModelHide/i.test(n.text || ''))
 assert(addToggle && typeof addToggle.onClick === 'function', 'custom-model add toggle present')
@@ -510,6 +537,7 @@ modelNodes = renderModels()
 buttonByText(modelNodes, 'addModelBtn').onClick()
 await settle()
 assert(lastApply().payload.models[0].id === 'my-custom-model' && JSON.stringify(lastApply().payload.models[0].input) === JSON.stringify(['text', 'image']), 'custom model add saves manual image capability')
+assert(lastApply().payload.models[0].inputMode === 'manual', 'custom model manual choice includes explicit input intent')
 modelNodes = renderModels()
 modelNodes.find((n) => n.tag === 'input' && n.props?.placeholder === 'addModelIdPlaceholder').onChange({ target: { value: 'automatic-custom-model' } })
 modelNodes = renderModels()

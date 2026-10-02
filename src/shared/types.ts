@@ -125,7 +125,7 @@ export interface ProviderProfile {
  * real model id forwarded to the provider (the wire id differs from the
  * selectable `id` — see the llm/stream rewrite in the host half). */
 export type ModelInput = 'text' | 'image'
-export type ModelCapabilitySource = 'configured' | 'discovery' | 'catalog'
+export type ModelCapabilitySource = 'configured' | 'manual' | 'discovery' | 'catalog' | 'official' | 'provider-default'
 
 export interface ModelCapabilitySummary {
   image: number
@@ -134,6 +134,8 @@ export interface ModelCapabilitySummary {
   preserved: number
   updated: number
   catalogUnavailable: boolean
+  rechecked: number
+  conflicts: number
 }
 
 export interface ModelEntry {
@@ -145,6 +147,8 @@ export interface ModelEntry {
   input?: ModelInput[]
   /** 仅用于展示识别来源，不写入供应商配置。 */
   capabilitySource?: ModelCapabilitySource
+  capabilityConflict?: boolean
+  capabilityReference?: string
   /** Optional wire model id different from `id`. */
   requestModel?: string
   [key: string]: unknown

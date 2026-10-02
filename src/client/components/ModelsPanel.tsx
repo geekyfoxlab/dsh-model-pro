@@ -185,14 +185,15 @@ export function ModelsPanel({
   }
 
   const saveModelConfig = async () => {
-    // 完整发送当前列表，才能保留“清空转发名”的修改；仅自动重置使用 null。
+    // 能力展示结果不等于人工选择；普通保存只更新其它模型字段。
     const list = curList.map((m) => {
       const choice = draftCapability(m.id)
-      const entry = { ...m, requestModel: m.requestModel?.trim() || null }
+      const entry: Record<string, unknown> = { ...m, requestModel: m.requestModel?.trim() || null }
+      delete entry.input
+      delete entry.inputMode
+      for (const key of Object.keys(entry)) if (key.startsWith('capability')) delete entry[key]
       if (!choice) return entry
-      // 来源仅描述读取结果；手动选择不应继续沿用“自动发现”的来源。
-      const { capabilitySource: _source, ...configured } = entry
-      return { ...configured, input: choice === 'auto' ? null : capabilityInput(choice) }
+      return { ...entry, inputMode: choice === 'auto' ? 'auto' : 'manual', input: choice === 'auto' ? null : capabilityInput(choice) }
     })
     if (!list.length) return
     setBusy(true); setStatus(null)
@@ -208,7 +209,7 @@ export function ModelsPanel({
     setBusy(true); setStatus(null)
     try {
       // 识别只发送 ID，避免把读取时附加的推断能力当成用户手动配置。
-      const r = await call('apply-models', { route, models: curList.map(({ id }) => ({ id })), mode: 'identify' })
+      const r = await call('apply-models', { route, models: curList.map(({ id }) => ({ id })), mode: 'identify', recheckLegacy: true })
       const fresh = await refreshModels()
       const summary = r.capabilitySummary as ModelCapabilitySummary | undefined
       const counts = summary ?? fresh.reduce((sum, m) => {
@@ -218,10 +219,11 @@ export function ModelsPanel({
         return sum
       }, { image: 0, text: 0, unknown: 0 })
       const result = summary
-        ? fmt(t('statusCapabilities'), { image: summary.image, text: summary.text, unknown: summary.unknown, preserved: summary.preserved, updated: summary.updated })
+        ? fmt(t('statusCapabilities'), { image: summary.image, text: summary.text, unknown: summary.unknown, preserved: summary.preserved, updated: summary.updated, rechecked: summary.rechecked ?? 0, conflicts: summary.conflicts ?? 0 })
         : fmt(t('statusCapabilitiesCurrent'), { image: counts.image, text: counts.text, unknown: counts.unknown })
       const hint = counts.unknown > 0 ? ` ${t('capabilitiesUnconfirmed')}` : ''
-      setStatus({ kind: summary?.catalogUnavailable ? 'err' : 'ok', text: `${summary?.catalogUnavailable ? `${t('capabilityCatalogUnavailable')} ` : ''}${result}${hint}` })
+      const conflictHint = (summary?.conflicts ?? 0) > 0 ? ` ${t('capabilityConflictHint')}` : ''
+      setStatus({ kind: summary?.catalogUnavailable ? 'err' : 'ok', text: `${summary?.catalogUnavailable ? `${t('capabilityCatalogUnavailable')} ` : ''}${result}${hint}${conflictHint}` })
     } catch (e) { fail(e) } finally { setBusy(false) }
   }
 
@@ -241,7 +243,7 @@ export function ModelsPanel({
       ...(numOrNull(draft.ctx) != null ? { contextWindow: numOrNull(draft.ctx) } : {}),
       ...(numOrNull(draft.out) != null ? { maxTokens: numOrNull(draft.out) } : {}),
       ...(draft.wire.trim() ? { requestModel: draft.wire.trim() } : {}),
-      ...(draft.capability !== 'auto' ? { input: capabilityInput(draft.capability) } : {}),
+      ...(draft.capability !== 'auto' ? { input: capabilityInput(draft.capability), inputMode: 'manual' } : {}),
     }
     setBusy(true); setStatus(null)
     try {
@@ -263,7 +265,23 @@ export function ModelsPanel({
 
   const capabilityBadge = (model: ModelEntry) => {
     const choice = capabilityChoice(model)
-    return <span className={choice === 'auto' ? 'mpro-chip mpro-capabilityUnknown' : 'mpro-chip'}>{t(choice === 'image' ? 'inputTextImage' : choice === 'text' ? 'inputTextOnly' : 'inputUnknown')}</span>
+    let sourceKey = 'capabilitySourceUnknown'
+    switch (String(model.capabilitySource)) {
+      case 'configured': sourceKey = 'capabilitySourceConfigured'; break
+      case 'manual': sourceKey = 'capabilitySourceManual'; break
+      case 'catalog': sourceKey = 'capabilitySourceCatalog'; break
+      case 'official': sourceKey = 'capabilitySourceOfficial'; break
+      case 'provider-default': sourceKey = 'capabilitySourceProviderDefault'; break
+      case 'discovery': sourceKey = 'capabilitySourceDiscovery'; break
+    }
+    return (
+      <div>
+        <span className={choice === 'auto' ? 'mpro-chip mpro-capabilityUnknown' : 'mpro-chip'}>{t(choice === 'image' ? 'inputTextImage' : choice === 'text' ? 'inputTextOnly' : 'inputUnknown')}</span>
+        <div className="mpro-hint">{t(sourceKey)}</div>
+        {typeof model.capabilityReference === 'string' && model.capabilityReference && <div className="mpro-hint" style={{ maxWidth: 260, overflowWrap: 'anywhere' }}>{t('capabilityReferenceLabel')}: {model.capabilityReference}</div>}
+        {model.capabilityConflict && <div className="mpro-hint">{t('capabilityConflictHint')}</div>}
+      </div>
+    )
   }
 
   const capabilitySelect = (value: CapabilityChoice, onChange: (value: CapabilityChoice) => void, label: string) => (
@@ -512,7 +530,7 @@ export function ModelsPanel({
                     <td>
                       <div className="mpro-capabilityCell">
                         {capabilityBadge(m)}
-                        {capabilitySelect(draftCapability(m.id) ?? capabilityChoice(m), (choice) => setCapabilityDraft((d) => ({ ...d, [m.id]: choice })), `${t('inputCapabilityCol')}: ${m.id}`)}
+                        {capabilitySelect(draftCapability(m.id) ?? (m.capabilitySource === 'manual' ? capabilityChoice(m) : 'auto'), (choice) => setCapabilityDraft((d) => ({ ...d, [m.id]: choice })), `${t('inputCapabilityCol')}: ${m.id}`)}
                       </div>
                     </td>
                     <td>

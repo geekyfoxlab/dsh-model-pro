@@ -112,9 +112,14 @@ assert.equal((await rpc('getRouteStats')).byTarget['existing\u0000original'].cal
 assert((await rpc('listRequestLogs')).entries.some((entry) => entry.route === 'prior-auto'), 'Own-form readiness must rehydrate persisted logs')
 // 真实 schema 把未声明的 input 物化为空数组，识别按钮仍须按目录补齐；旧文本默认不阻断。
 assert.deepEqual(section('llm-pi-ai').providers['identify-test'].models[0].input, [])
+const initialIdentifyModels = plain(section('llm-pi-ai').providers['identify-test'].models)
+let manualSetup = await rpc('applyModels', { route: 'identify-test', mode: 'merge', models: [{ id: 'manual-text', input: ['text'], inputMode: 'manual' }] })
+assert.equal(manualSetup.ok, true, manualSetup.error)
+await st.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'identify-test', 'models'], value: initialIdentifyModels }], st.describe().find(({ ns }) => ns === 'llm-pi-ai').revision)
+catalogReads = 0
 const identifyBefore = section('llm-pi-ai').providers['identify-test']
 const identifyOtherFields = JSON.stringify(Object.fromEntries(Object.entries(identifyBefore).filter(([key]) => key !== 'models')))
-const identifyArgs = { route: 'identify-test', mode: 'identify', models: identifyBefore.models.map(({ id }) => ({ id })) }
+const identifyArgs = { route: 'identify-test', mode: 'identify', recheckLegacy: true, models: identifyBefore.models.map(({ id }) => ({ id })) }
 let identified = await rpc('applyModels', identifyArgs)
 assert.equal(identified.ok, true, identified.error)
 assert.equal(identified.capabilitySummary.updated, 3)
@@ -122,6 +127,8 @@ assert.equal(identified.capabilitySummary.preserved, 1)
 assert.equal(identified.capabilitySummary.unknown, 1)
 assert.equal(identified.capabilitySummary.image, 2)
 assert.equal(identified.capabilitySummary.text, 2)
+assert.equal(identified.capabilitySummary.rechecked, 4)
+assert.equal(identified.capabilitySummary.conflicts, 0)
 assert.equal(identified.capabilitySummary.catalogUnavailable, false)
 assert.equal(catalogReads, 1, 'One identify operation shares a refreshed catalog across all models')
 let identifiedProfile = section('llm-pi-ai').providers['identify-test']
@@ -136,7 +143,9 @@ const afterIdentifyRaw = JSON.stringify(entries.map((entry) => entry.options.con
 identified = await rpc('applyModels', identifyArgs)
 assert.equal(identified.ok, true, identified.error)
 assert.equal(identified.capabilitySummary.updated, 0)
-assert.equal(identified.capabilitySummary.preserved, 4)
+assert.equal(identified.capabilitySummary.preserved, 1)
+assert.equal(identified.capabilitySummary.rechecked, 4)
+assert.equal(identified.capabilitySummary.conflicts, 0)
 assert.equal(identified.capabilitySummary.unknown, 1)
 assert.equal(st.describe().find(({ ns }) => ns === 'llm-pi-ai').revision, afterIdentifyRevision)
 assert.equal(JSON.stringify(entries.map((entry) => entry.options.config)), afterIdentifyRaw, 'Idempotent identify does not write resolved schema defaults')
@@ -174,6 +183,8 @@ assert.equal(secrets.get('DSH_COMPAT_TEST_API_KEY'), 'synthetic-test-key')
 assert(!JSON.stringify(entries.map((x) => x.options.config)).includes('synthetic-test-key'))
 r = await rpc('getProvider', { route: 'compat-test', includeSecret: true })
 assert.equal(r.secret, 'synthetic-test-key')
+assert.equal(r.models[0].capabilitySource, 'discovery')
+const storedCapabilities = JSON.stringify(section('dsh-model-pro').state.modelCapabilities['compat-test'])
 for (const enabled of [false, true, false, true]) {
   r = await rpc('toggleProvider', { route: 'compat-test', enabled })
   assert.equal(r.ok, true, r.error)
@@ -181,6 +192,7 @@ for (const enabled of [false, true, false, true]) {
   assert.equal(!!section('dsh-model-pro').state.disabledProviders['compat-test'], !enabled)
   const profile = enabled ? section('llm-pi-ai').providers['compat-test'] : section('dsh-model-pro').state.disabledProviders['compat-test']
   assert.deepEqual(plain(profile.models[0].input), ['text', 'image'])
+  assert.equal(JSON.stringify(section('dsh-model-pro').state.modelCapabilities['compat-test']), storedCapabilities)
 }
 r = await rpc('setRoute', { alias: 'test-auto', strategy: 'priority', targets: [{ provider: 'compat-test', model: 'test-model' }] })
 assert.equal(r.ok, true, r.error)
@@ -226,6 +238,8 @@ if (actualRoot) {
 await new Promise((resolve) => setTimeout(resolve, 5))
 assert(!section('llm-pi-ai').providers['compat-test'])
 assert(section('dsh-model-pro').state.disabledProviders['compat-test'])
+r = await rpc('getProvider', { route: 'compat-test' })
+assert.equal(r.models[0].capabilitySource, 'discovery', 'Own schema source metadata survives actual Cordis unload/reinstall')
 r = await rpc('toggleProvider', { route: 'compat-test', enabled: true })
 assert.equal(r.ok, true, r.error)
 r = await rpc('deleteProvider', { route: 'compat-test' })

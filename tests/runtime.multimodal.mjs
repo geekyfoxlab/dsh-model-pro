@@ -20,10 +20,11 @@ const plain = (value) => JSON.parse(JSON.stringify(value))
 let code = readFileSync(process.env.MODEL_PRO_HOST_BUNDLE || new URL('../dist/host.js', import.meta.url), 'utf8')
 code = code.replace(/^import .* from ["']@deepseek-ai\/[^"']+["'];?$/gm, '')
 code = code.replace(/export\s*\{[\s\S]*?\};?\s*$/m, '')
-const api = vm.runInNewContext(`(() => { ${code}; return { makeRouterAdapter, resolveModelInput, applyModels, Config }; })()`, {
+const loadHost = () => vm.runInNewContext(`(() => { ${code}; return { makeRouterAdapter, resolveModelInput, applyModels, getProvider, Config }; })()`, {
   z, console, setTimeout, clearTimeout, AbortController, TextEncoder, TextDecoder, crypto: globalThis.crypto,
   TypertRemoteService: class {},
 })
+let api = loadHost()
 
 // PiConfig 的 input 字段决定真实服务描述符；同名模型处于自定义 route 时没有目录继承。
 let piAdapter, discover, directory
@@ -77,10 +78,16 @@ const identifyOriginal = { providers: {
     { id: 'gpt-4o' }, { id: 'manual-text', input: ['text'] }, { id: 'wire-alias', requestModel: 'gpt-4o' }, { id: 'unknown-id' },
   ] },
   unknown: { api: 'openai-completions', baseURL: 'https://unknown-fixture.invalid/v1', models: [{ id: 'recovered-image' }] },
+  legacy: { api: 'openai-completions', baseURL: 'https://legacy-fixture.invalid/v1', models: [{ id: 'deepseek-v4.1-flash', input: ['text'] }] },
+  radius: { api: 'openai-completions', baseURL: 'https://radius-fixture.invalid/v1', models: [{ id: 'deepseek-v4.1-flash', input: ['text'] }] },
+  'field-race': { api: 'openai-completions', baseURL: 'https://field-race.invalid/v1', displayName: 'Original provider name', headers: { 'X-Original': 'old' }, models: [{ id: 'gpt-4o' }] },
   existing: { api: 'openai-completions', baseURL: 'https://existing-fixture.invalid/v1', apiKeyEnv: 'SYNTHETIC_EXISTING_REF', headers: { 'X-Original': 'keep' }, models: [{ id: 'original-model', input: ['text'] }] },
 } }
+const identifySeed = structuredClone(identifyOriginal)
+// 手工意图必须经新 RPC 显式保存；其余模型稍后由真实原生 schema 加回夹具。
+identifySeed.providers.target.models = [{ id: 'manual-text', input: ['text'] }]
 const identifyEntries = [
-  { id: 'llm-pi-ai', options: { id: 'llm-pi-ai', config: structuredClone(identifyOriginal) }, fiber: { uid: 11, state: 2, runtime: { Config: PiConfig }, config: PiConfig(structuredClone(identifyOriginal)), ctx: new Context() } },
+  { id: 'llm-pi-ai', options: { id: 'llm-pi-ai', config: structuredClone(identifySeed) }, fiber: { uid: 11, state: 2, runtime: { Config: PiConfig }, config: PiConfig(structuredClone(identifySeed)), ctx: new Context() } },
   { id: 'dsh-model-pro', options: { id: 'dsh-model-pro', config: { state: {} } }, fiber: { uid: 12, state: 2, runtime: { Config: api.Config }, config: api.Config({ state: {} }), ctx: new Context() } },
 ]
 let identifyWrites = 0
@@ -98,13 +105,16 @@ const identifySettings = Object.create(SettingsForms.prototype)
 Object.assign(identifySettings, { revisions: new Map(), presentations: new Map(), ownerContext: { emit() {}, configEditor: identifyEditor } })
 const identifySection = () => identifySettings.describe().find(({ ns }) => ns === 'llm-pi-ai').value
 const identifyRevision = () => identifySettings.describe().find(({ ns }) => ns === 'llm-pi-ai').revision
+const ownSection = () => identifySettings.describe().find(({ ns }) => ns === 'dsh-model-pro').value
+const ownRevision = () => identifySettings.describe().find(({ ns }) => ns === 'dsh-model-pro').revision
 let discoveryMode = 'ready'
 let identifyReads = 0
 const identifyService = {
-  listConfigurableProviders: () => discoveryMode === 'empty' ? [] : [{ settingsNs: 'llm-pi-ai', provider: 'openai', declared: false }],
-  async discoverModels() {
+  listConfigurableProviders: () => discoveryMode === 'empty' ? [] : (discoveryMode === 'deepseek' ? ['opencode', 'radius'] : ['openai']).map((provider) => ({ settingsNs: 'llm-pi-ai', provider, declared: false })),
+  async discoverModels(_ns, request) {
     identifyReads++
     if (discoveryMode === 'failed') throw new Error('synthetic directory not ready')
+    if (discoveryMode === 'deepseek') return [{ id: 'deepseek-v4.1-flash', inputModalities: request.provider === 'radius' ? ['text'] : ['text', 'image'] }]
     if (discoveryMode === 'concurrent') {
       // 目录读取尚未完成时，另一个会话保存了同一模型的名称、转发名和手工文本能力。
       const current = structuredClone(identifySection().providers.target.models)
@@ -118,14 +128,19 @@ const identifyService = {
   },
 }
 const identifyCtx = { get: (name) => name === 'settings' ? identifySettings : name === 'llm' ? identifyService : name === 'configEditor' ? identifyEditor : undefined }
+let detected = await api.applyModels(identifyCtx, { route: 'target', mode: 'merge', models: [{ id: 'manual-text', input: ['text'], inputMode: 'manual' }] })
+assert.equal(detected.ok, true, detected.error)
+await identifySettings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'target', 'models'], value: structuredClone(identifyOriginal.providers.target.models) }], identifyRevision())
+api = loadHost()
+identifyReads = 0
 assert.deepEqual(identifySection().providers.target.models[0].input, [])
 assert.equal(await api.resolveModelInput(identifyCtx, 'unknown', identifySection().providers.unknown.models[0]), undefined)
 const originalExisting = JSON.stringify(identifySection().providers.existing)
 const targetOtherFields = JSON.stringify(Object.fromEntries(Object.entries(identifySection().providers.target).filter(([key]) => key !== 'models')))
-const identifyRequest = { route: 'target', mode: 'identify', models: identifyOriginal.providers.target.models.map(({ id }) => ({ id })) }
-let detected = await api.applyModels(identifyCtx, identifyRequest)
+const identifyRequest = { route: 'target', mode: 'identify', recheckLegacy: true, models: identifyOriginal.providers.target.models.map(({ id }) => ({ id })) }
+detected = await api.applyModels(identifyCtx, identifyRequest)
 assert.equal(detected.ok, true, detected.error)
-assert.deepEqual(plain(detected.capabilitySummary), { image: 2, text: 1, unknown: 1, preserved: 1, updated: 2, catalogUnavailable: false })
+assert.deepEqual(plain(detected.capabilitySummary), { image: 2, text: 1, unknown: 1, preserved: 1, updated: 2, rechecked: 3, conflicts: 0, catalogUnavailable: false })
 assert.equal(identifyReads, 2, 'Explicit identify refreshes a previously read directory, then shares it across target models')
 let targetModels = identifySection().providers.target.models
 assert.deepEqual(plain(targetModels.find(({ id }) => id === 'gpt-4o').input), ['text', 'image'])
@@ -141,7 +156,9 @@ const settledRaw = JSON.stringify(identifyEntries.map((entry) => entry.options.c
 detected = await api.applyModels(identifyCtx, identifyRequest)
 assert.equal(detected.ok, true, detected.error)
 assert.equal(detected.capabilitySummary.updated, 0)
-assert.equal(detected.capabilitySummary.preserved, 3)
+assert.equal(detected.capabilitySummary.preserved, 1)
+assert.equal(detected.capabilitySummary.rechecked, 3)
+assert.equal(detected.capabilitySummary.conflicts, 0)
 assert.equal(detected.capabilitySummary.unknown, 1)
 assert.equal(identifyWrites, settledWrites)
 assert.equal(identifyRevision(), settledRevision)
@@ -180,10 +197,159 @@ assert.equal(concurrentModel.requestModel, 'new-wire-id')
 assert.deepEqual(plain(concurrentModel.input), ['text'])
 discoveryMode = 'ready'
 
-// 普通保存的空 input 按 Pi 原生语义回到自动模式，不能因 schema 默认数组被拒绝。
+// 空 input 回到自动模式；通用 text 默认不能遮住目录已确认的图片能力。
 detected = await api.applyModels(identifyCtx, { route: 'target', mode: 'merge', models: [{ id: 'manual-text', input: [] }] })
 assert.equal(detected.ok, true, detected.error)
-assert.deepEqual(plain(identifySection().providers.target.models.find(({ id }) => id === 'manual-text').input), ['text'])
+assert.deepEqual(plain(identifySection().providers.target.models.find(({ id }) => id === 'manual-text').input), ['text', 'image'])
+assert.equal(JSON.stringify(identifySection().providers.existing), originalExisting)
+
+// 来源保存在真实插件 schema 的 own state；重新创建 VM 后不依赖旧进程缓存。
+let freshHost = loadHost()
+let shown = await freshHost.getProvider(identifyCtx, { route: 'target' })
+assert.equal(shown.ok, true, shown.error)
+assert.equal(shown.models.find(({ id }) => id === 'gpt-4o').capabilitySource, 'catalog')
+assert.equal(shown.models.find(({ id }) => id === 'manual-text').capabilitySource, 'catalog')
+assert(ownSection().state.modelCapabilities, 'Source records must be owned by the plugin SettingsForms schema')
+for (const entry of identifySection().providers.target.models) {
+  for (const key of ['capabilitySource', 'capabilityReference', 'capabilityConflict', 'inputMode', 'inputModalities']) {
+    assert(!Object.hasOwn(entry, key), `${key} must not be persisted in the native Pi schema`)
+  }
+}
+
+// 旧 RPC 默认保留无法判定来源的 text；新 UI 明确要求重新核对旧配置。
+discoveryMode = 'deepseek'
+shown = await freshHost.getProvider(identifyCtx, { route: 'legacy' })
+assert.equal(shown.models[0].capabilitySource, 'configured')
+const legacyRequest = { route: 'legacy', mode: 'identify', models: [{ id: 'deepseek-v4.1-flash' }] }
+detected = await freshHost.applyModels(identifyCtx, legacyRequest)
+assert.equal(detected.ok, true, detected.error)
+assert.equal(detected.capabilitySummary.updated, 0)
+assert.equal(detected.capabilitySummary.preserved, 1)
+assert.deepEqual(plain(identifySection().providers.legacy.models[0].input), ['text'])
+detected = await freshHost.applyModels(identifyCtx, { ...legacyRequest, recheckLegacy: true })
+assert.equal(detected.ok, true, detected.error)
+assert.equal(detected.capabilitySummary.updated, 1)
+assert.equal(detected.capabilitySummary.rechecked, 1)
+assert.equal(detected.capabilitySummary.conflicts, 1)
+assert.deepEqual(plain(identifySection().providers.legacy.models[0].input), ['text', 'image'])
+freshHost = loadHost()
+shown = await freshHost.getProvider(identifyCtx, { route: 'legacy' })
+assert.equal(shown.models[0].capabilitySource, 'official')
+assert.equal(shown.models[0].capabilityConflict, true)
+assert.match(shown.models[0].capabilityReference, /^https:\/\//)
+assert(!shown.models[0].capabilityReference.includes('.invalid'))
+
+// 同供应商实际目录比官方模型基线优先，Radius 的 text 不能被跨目录视觉值覆盖。
+detected = await freshHost.applyModels(identifyCtx, { route: 'radius', mode: 'identify', recheckLegacy: true, models: [{ id: 'deepseek-v4.1-flash' }] })
+assert.equal(detected.ok, true, detected.error)
+assert.deepEqual(plain(identifySection().providers.radius.models[0].input), ['text'])
+shown = await freshHost.getProvider(identifyCtx, { route: 'radius' })
+assert.equal(shown.models[0].capabilitySource, 'catalog')
+
+// 同值选择“仅文本”也产生明确手工记录，随后重新识别必须保留。
+detected = await freshHost.applyModels(identifyCtx, { route: 'legacy', mode: 'merge', models: [{ id: 'deepseek-v4.1-flash', input: ['text'], inputMode: 'manual', capabilitySource: 'official', capabilityReference: 'https://synthetic.invalid', capabilityConflict: true }] })
+assert.equal(detected.ok, true, detected.error)
+freshHost = loadHost()
+shown = await freshHost.getProvider(identifyCtx, { route: 'legacy' })
+assert.equal(shown.models[0].capabilitySource, 'manual')
+detected = await freshHost.applyModels(identifyCtx, { ...legacyRequest, recheckLegacy: true })
+assert.equal(detected.ok, true, detected.error)
+assert.equal(detected.capabilitySummary.preserved, 1)
+assert.equal(detected.capabilitySummary.updated, 0)
+assert.deepEqual(plain(identifySection().providers.legacy.models[0].input), ['text'])
+for (const key of ['capabilitySource', 'capabilityReference', 'capabilityConflict', 'inputMode']) assert(!Object.hasOwn(identifySection().providers.legacy.models[0], key))
+
+// 修改实际转发型号后，旧目录图片能力不能沿用到未知型号。
+discoveryMode = 'ready'
+detected = await freshHost.applyModels(identifyCtx, { route: 'target', mode: 'merge', models: [{ id: 'wire-alias', requestModel: 'unlisted-wire-model' }] })
+assert.equal(detected.ok, true, detected.error)
+shown = await loadHost().getProvider(identifyCtx, { route: 'target' })
+assert.equal(shown.models.find(({ id }) => id === 'wire-alias').requestModel, 'unlisted-wire-model')
+assert(!shown.models.find(({ id }) => id === 'wire-alias').input?.includes('image'), 'An automatic source record belongs to the actual wire model')
+
+// 来源记录同时绑定供应商协议/地址；外部配置改动不能继续被标成原手工来源。
+await identifySettings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'legacy', 'baseURL'], value: 'https://changed-endpoint.invalid/v1' }], identifyRevision())
+shown = await loadHost().getProvider(identifyCtx, { route: 'legacy' })
+assert.equal(shown.models[0].capabilitySource, 'configured')
+await identifySettings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', 'legacy', 'baseURL'], value: identifyOriginal.providers.legacy.baseURL }], identifyRevision())
+
+// 原生与插件来源分别写入时任一失败，不能留下新的 native input 或丢掉旧来源。
+const realIdentifyMutate = identifySettings.mutate.bind(identifySettings)
+for (const failedNs of ['dsh-model-pro', 'llm-pi-ai']) {
+  const priorNative = JSON.stringify(identifyEntries[0].options.config)
+  const priorOwn = JSON.stringify(ownSection().state.modelCapabilities)
+  let failOnce = true
+  identifySettings.mutate = async (ns, ...args) => {
+    if (ns === failedNs && failOnce) { failOnce = false; throw new Error(`synthetic ${failedNs} source-write failure`) }
+    return realIdentifyMutate(ns, ...args)
+  }
+  detected = await freshHost.applyModels(identifyCtx, { route: 'legacy', mode: 'merge', models: [{ id: 'deepseek-v4.1-flash', input: ['text', 'image'], inputMode: 'manual' }] })
+  identifySettings.mutate = realIdentifyMutate
+  assert.equal(detected.ok, false, `Injected ${failedNs} write failure must be reported`)
+  assert.equal(JSON.stringify(identifyEntries[0].options.config), priorNative)
+  assert.equal(JSON.stringify(ownSection().state.modelCapabilities), priorOwn)
+}
+
+// native 提交失败时，回滚本 route 来源须保留等待期间另一个 route 的外部修改。
+const priorFailedCommit = JSON.stringify(identifyEntries[0].options.config)
+let injectConcurrentRollback = true
+identifySettings.mutate = async (ns, ...args) => {
+  if (ns === 'llm-pi-ai' && injectConcurrentRollback) {
+    injectConcurrentRollback = false
+    await realIdentifyMutate('dsh-model-pro', [{ op: 'set', path: ['state', 'modelCapabilities', 'radius', 'models', 'deepseek-v4.1-flash', 'source'], value: 'manual' }], ownRevision())
+    throw new Error('synthetic native failure after another provider source edit')
+  }
+  return realIdentifyMutate(ns, ...args)
+}
+detected = await freshHost.applyModels(identifyCtx, { route: 'legacy', mode: 'merge', models: [{ id: 'deepseek-v4.1-flash', input: ['text', 'image'], inputMode: 'manual' }] })
+identifySettings.mutate = realIdentifyMutate
+assert.equal(detected.ok, false)
+assert.equal(JSON.stringify(identifyEntries[0].options.config), priorFailedCommit)
+shown = await loadHost().getProvider(identifyCtx, { route: 'radius' })
+assert.equal(shown.models[0].capabilitySource, 'manual', 'A failed native commit must not roll back another provider source edit')
+shown = await loadHost().getProvider(identifyCtx, { route: 'legacy' })
+assert.equal(shown.models[0].capabilitySource, 'manual', 'The original manual source of the failed route must be restored')
+
+// 模型目录等待期间的名称、请求头和凭据引用修改，应从 fresh profile 保留。
+const beforeFieldRaceDiscovery = identifyService.discoverModels
+let fieldsChanged = false
+identifyService.discoverModels = async (...args) => {
+  if (!fieldsChanged) {
+    fieldsChanged = true
+    await realIdentifyMutate('llm-pi-ai', [
+      { op: 'set', path: ['providers', 'field-race', 'displayName'], value: 'Concurrent provider name' },
+      { op: 'set', path: ['providers', 'field-race', 'headers'], value: { 'X-Concurrent': 'new' } },
+      { op: 'set', path: ['providers', 'field-race', 'apiKeyEnv'], value: 'SYNTHETIC_CONCURRENT_REF' },
+    ], identifyRevision())
+  }
+  return beforeFieldRaceDiscovery(...args)
+}
+detected = await freshHost.applyModels(identifyCtx, { route: 'field-race', mode: 'identify', recheckLegacy: true, models: [{ id: 'gpt-4o' }] })
+identifyService.discoverModels = beforeFieldRaceDiscovery
+assert.equal(detected.ok, true, detected.error)
+assert.equal(identifySection().providers['field-race'].displayName, 'Concurrent provider name')
+assert.deepEqual(plain(identifySection().providers['field-race'].headers), { 'X-Concurrent': 'new' })
+assert.equal(identifySection().providers['field-race'].apiKeyEnv, 'SYNTHETIC_CONCURRENT_REF')
+assert.deepEqual(plain(identifySection().providers['field-race'].models[0].input), ['text', 'image'])
+
+// 等待目录时来源被另一会话改成手工声明，同一 native input 也必须检测并发冲突。
+const normalDiscovery = identifyService.discoverModels
+let metadataChanged = false
+identifyService.discoverModels = async (...args) => {
+  if (!metadataChanged) {
+    metadataChanged = true
+    const records = structuredClone(ownSection().state.modelCapabilities)
+    records.target.models['gpt-4o'].source = 'manual'
+    await realIdentifyMutate('dsh-model-pro', [{ op: 'set', path: ['state', 'modelCapabilities'], value: records }], ownRevision())
+  }
+  return normalDiscovery(...args)
+}
+detected = await freshHost.applyModels(identifyCtx, { route: 'target', mode: 'identify', recheckLegacy: true, models: [{ id: 'gpt-4o' }] })
+identifyService.discoverModels = normalDiscovery
+assert.equal(detected.ok, false, 'Concurrent source changes must not be overwritten by stale automatic detection')
+assert.match(detected.error, /模型|来源|刷新|变化|conflict|revision/i)
+shown = await loadHost().getProvider(identifyCtx, { route: 'target' })
+assert.equal(shown.models.find(({ id }) => id === 'gpt-4o').capabilitySource, 'manual')
 assert.equal(JSON.stringify(identifySection().providers.existing), originalExisting)
 
 // 替换最低层事件源，保留真实 PiAiAdapter 的附件准备、base64 与 PiContext 转换。
@@ -266,4 +432,4 @@ assert.equal(received[0].messages[0].content[1].type, 'image')
 assert(chunks.some((chunk) => chunk.type === 'text-delta'))
 assert.equal(chunks.at(-1).reason.kind, 'stop')
 await assert.rejects(async () => { for await (const _chunk of router.stream({ provider: 'router', model: 'textOnly', messages })) {} }, /没有支持图片输入/)
-console.log('PASS: actual SettingsForms capability-button identification, schema-default empty input, idempotence and catalog recovery; PiConfig / PiAiAdapter metadata and base64 conversion, exact wire-id capability, LlmRuntime virtual-route preparation and image dispatch')
+console.log('PASS: actual SettingsForms capability identification and source persistence across fresh VMs, legacy DeepSeek recheck and conflicting catalogs, manual intent, wire/endpoint binding, source/native rollback and concurrent model/source protection; PiConfig / PiAiAdapter metadata and base64 conversion, LlmRuntime virtual-route preparation and image dispatch')

@@ -6,7 +6,7 @@ DeepSeek Harness 0.2.0-rc.2 更改了 Typert codec 和设置服务接口。1.1.8
 
 - RPC codec 增加 create() 工厂，提供与原 schema 相同的校验。
 - 新版从 settings.describe() 读取，使用 mutate() 和 expectedRevision 保存。
-- llm-pi-ai 只写 providers。禁用档案、路由、组合、界面偏好和观测快照保存到 dsh-model-pro.state（本插件的 volatile 配置字段）。
+- llm-pi-ai 只写 providers。禁用档案、路由、组合、界面偏好、能力来源和观测快照保存到 dsh-model-pro.state（本插件的 volatile 配置字段）。
 - 禁用前先保存备份；供应商写入失败时回滚禁用状态。卸载时保留已缓存状态以恢复供应商，重装后重新应用禁用标记。
 - 等本插件配置表单就绪后恢复观测快照和禁用状态，兼容插件的不同加载顺序。
 
@@ -27,7 +27,7 @@ tests/runtime.compat.mjs 使用 Harness 自带的 TypertRegistry、SettingsForms
 
 tests/runtime.multimodal.mjs 额外验证真实 PiAiAdapter 的图片能力及附件转换、LlmRuntime 的智能路由/组合能力、图片目标筛选。底层推理流使用内存替身，不向外部供应商发送请求。配置测试也覆盖 input 的保存、禁用/启用及卸载恢复。
 
-识别按钮回归使用真实 schema 生成的 `input: []`，验证目录识别及保存、已有设置保留、识别数量、目录失败与恢复、重复识别零写入，以及识别期间的并发模型编辑保护。客户端回归还验证失败提示在当前编辑页可见。
+识别按钮回归使用真实 schema 生成的 `input: []`，验证目录识别及保存、旧 DeepSeek V4.1 Flash 文本配置的显式复核、人工锁定和自动来源恢复、目录差异、目录失败与恢复及幂等写入。来源绑定供应商接口与实际型号；模型或来源并发改变时拒绝旧结果，名称、请求头及密钥引用的并发编辑仍会保留。两份配置任一写入失败时返回错误并回滚本次来源，保留外部更新。客户端回归还验证来源、复核数量与失败提示在当前编辑页可见。通用文本默认不会让未确认型号显示为“仅文本”。
 
 ```sh
 DSH_RUNTIME_ROOT=/path/to/dsh npm run test:runtime
