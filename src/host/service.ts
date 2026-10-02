@@ -22,6 +22,7 @@ import { updateField } from './handlers/updateField'
 import { updateHeaders } from './handlers/updateHeaders'
 import { applyModels } from './handlers/applyModels'
 import { testProvider } from './handlers/test'
+import { verifyImageInput } from './handlers/verifyImage'
 import { setApiKey } from './handlers/updateKey'
 import { listRoutes, setRoute, deleteRoute } from './handlers/routes'
 import { listComposites, setComposite, deleteComposite, previewComposite } from './handlers/composites'
@@ -71,6 +72,9 @@ export class ModelProRuntime extends (TypertRemoteService as any) {
   }
   async testProvider(args: any) {
     return testProvider(this.ctx, args || {})
+  }
+  async verifyImageInput(args: any) {
+    return verifyImageInput(this.ctx, args || {})
   }
   async setApiKey(args: any) {
     return setApiKey(this.ctx, args || {})

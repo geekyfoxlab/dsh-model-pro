@@ -4,7 +4,7 @@
  * custom-model add form. */
 
 import React from '../react'
-import type { ModelEntry, ModelCapabilitySummary, DiscoveredModel, InfoState, StatusMsg, TFunc, CallFn } from '../../shared/types'
+import type { ModelEntry, ModelCapabilitySummary, ImageVerification, DiscoveredModel, InfoState, StatusMsg, TFunc, CallFn } from '../../shared/types'
 import { fmt } from '../labels'
 
 interface Props {
@@ -227,6 +227,22 @@ export function ModelsPanel({
     } catch (e) { fail(e) } finally { setBusy(false) }
   }
 
+  const verifyImageInput = async (model: ModelEntry) => {
+    if (busy || hasUnsavedConfig || !model.input?.includes('image')) return
+    setBusy(true); setStatus(null)
+    try {
+      const r = await call('verify-image-input', { route, model: model.id })
+      const verification = r.verification as ImageVerification
+      await refreshModels()
+      const result = fmt(t(verification.status === 'verified' ? 'statusImageVerified' : 'statusImageUnconfirmed'), {
+        passed: verification.passed, total: verification.total, latencyMs: verification.latencyMs,
+      })
+      const detail = verification.message ? ` ${verification.message}` : ''
+      const unsaved = r.saved ? '' : ` ${t('imageVerificationNotSaved')}${r.error ? ` ${r.error}` : ''}`
+      setStatus({ kind: verification.status === 'verified' && r.saved ? 'ok' : 'err', text: `${result}${detail}${unsaved}` })
+    } catch (e) { fail(e) } finally { setBusy(false) }
+  }
+
   // --- manual custom-model add ----------------------------------------------
   const setDraftField = (p: Partial<AddDraft>) => setDraft((d) => ({ ...d, ...p }))
   const numOrNull = (v: string): number | undefined => {
@@ -265,6 +281,8 @@ export function ModelsPanel({
 
   const capabilityBadge = (model: ModelEntry) => {
     const choice = capabilityChoice(model)
+    // 旧配置或未允许图片的模型不能沿用残留的图片验证结果。
+    const verification = choice === 'image' ? model.capabilityVerification : undefined
     let sourceKey = 'capabilitySourceUnknown'
     switch (String(model.capabilitySource)) {
       case 'configured': sourceKey = 'capabilitySourceConfigured'; break
@@ -280,6 +298,8 @@ export function ModelsPanel({
         <div className="mpro-hint">{t(sourceKey)}</div>
         {typeof model.capabilityReference === 'string' && model.capabilityReference && <div className="mpro-hint" style={{ maxWidth: 260, overflowWrap: 'anywhere' }}>{t('capabilityReferenceLabel')}: {model.capabilityReference}</div>}
         {model.capabilityConflict && <div className="mpro-hint">{t('capabilityConflictHint')}</div>}
+        <div className="mpro-hint">{t(verification?.status === 'verified' ? 'imageVerified' : verification?.status === 'unconfirmed' ? 'imageVerificationUnconfirmed' : 'imageNotVerified')}</div>
+        {verification?.checkedAt && <div className="mpro-hint">{fmt(t('imageVerificationCheckedAt'), { at: verification.checkedAt })}</div>}
       </div>
     )
   }
@@ -303,6 +323,7 @@ export function ModelsPanel({
     <div className="mpro-panel">
       <p className="mpro-hint">{t('modelsHint')}</p>
       <p className="mpro-hint">{t('inputCapabilityHint')}</p>
+      <p className="mpro-hint">{t('imageVerificationHint')}</p>
 
       {/* discovery bar */}
       <div className="mpro-discoverBar">
@@ -531,6 +552,16 @@ export function ModelsPanel({
                       <div className="mpro-capabilityCell">
                         {capabilityBadge(m)}
                         {capabilitySelect(draftCapability(m.id) ?? (m.capabilitySource === 'manual' ? capabilityChoice(m) : 'auto'), (choice) => setCapabilityDraft((d) => ({ ...d, [m.id]: choice })), `${t('inputCapabilityCol')}: ${m.id}`)}
+                        <div>
+                          <button
+                            className="mpro-btn mpro-btnSm"
+                            aria-label={`${t('verifyImageInput')}: ${m.id}`}
+                            disabled={busy || hasUnsavedConfig || !m.input?.includes('image')}
+                            title={hasUnsavedConfig ? t('saveModelConfigFirst') : !m.input?.includes('image') ? t('imageVerificationNeedsImages') : t('imageVerificationHint')}
+                            onClick={() => void verifyImageInput(m)}
+                          >{t('verifyImageInput')}</button>
+                          {!m.input?.includes('image') && <div className="mpro-hint">{t('imageVerificationNeedsImages')}</div>}
+                        </div>
                       </div>
                     </td>
                     <td>
@@ -539,6 +570,7 @@ export function ModelsPanel({
                         title={t('reqModelHint')}
                         className="mpro-input mpro-inputMono"
                         style={{ width: 150 }}
+                        disabled={busy}
                         value={m.requestModel || ''}
                         placeholder="—"
                         onChange={(e) => void setRequestModel(m.id, e.target.value)}

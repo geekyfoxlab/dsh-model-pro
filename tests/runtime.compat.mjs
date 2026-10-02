@@ -32,7 +32,7 @@ if (process.env.EXPECT_INCOMPATIBLE === '1') {
   process.exit(0)
 }
 registry.register(api.TYPERT_MANIFEST)
-assert.equal(registry.local.list().length, 25)
+assert.equal(registry.local.list().length, 26)
 for (const descriptor of api.TYPERT_MANIFEST.invocations) {
   assert.throws(() => descriptor.parameters[0].codec.create().parse([]))
   assert.throws(() => descriptor.result.create().parse({}))

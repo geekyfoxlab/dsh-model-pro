@@ -6,7 +6,7 @@ DeepSeek Harness 0.2.0-rc.2 更改了 Typert codec 和设置服务接口。1.1.8
 
 - RPC codec 增加 create() 工厂，提供与原 schema 相同的校验。
 - 新版从 settings.describe() 读取，使用 mutate() 和 expectedRevision 保存。
-- llm-pi-ai 只写 providers。禁用档案、路由、组合、界面偏好、能力来源和观测快照保存到 dsh-model-pro.state（本插件的 volatile 配置字段）。
+- llm-pi-ai 只写 providers。禁用档案、路由、组合、界面偏好、能力来源、图片验证结果和观测快照保存到 dsh-model-pro.state（本插件的 volatile 配置字段）。
 - 禁用前先保存备份；供应商写入失败时回滚禁用状态。卸载时保留已缓存状态以恢复供应商，重装后重新应用禁用标记。
 - 等本插件配置表单就绪后恢复观测快照和禁用状态，兼容插件的不同加载顺序。
 
@@ -18,6 +18,8 @@ npm run typecheck
 npm run build
 npm test
 ```
+
+图片验证回归还覆盖随机 PNG 答案核对、两次通过存证、失败不降级、本地能力拦截、超时及晚请求锁、配置/凭据变化失效；证据仅保存在插件状态。
 
 Host 冒烟测试覆盖旧版和新版设置接口、供应商增删改、请求头、模型、密钥加密、启停、路由、组合、统计快照、revision 冲突、写入失败回滚及卸载重装。
 

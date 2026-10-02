@@ -4,6 +4,7 @@ import type { ModelEntry, ModelInput, ModelCapabilitySource } from '../shared/ty
 import type { HostCtx, LLMService } from './utils'
 import { readProviders, readDisabled, readProfile } from './utils'
 import { readCapabilityState, capabilityRecord, type CapabilityRecord } from './capabilityStore'
+import { resolvedImageVerificationBinding, savedImageVerification } from './imageVerificationStore'
 
 interface CatalogInputs {
   byRoute: Map<string, Map<string, ModelInput[] | null>>
@@ -171,6 +172,7 @@ export async function describeModelInput(ctx: HostCtx, route: string, entry: Mod
   delete out.capabilitySource
   delete out.capabilityConflict
   delete out.capabilityReference
+  delete out.capabilityVerification
   delete out.input
   if (input) {
     out.input = [...input]
@@ -178,5 +180,15 @@ export async function describeModelInput(ctx: HostCtx, route: string, entry: Mod
     if (saved?.reference ?? inferred?.reference) out.capabilityReference = saved?.reference ?? inferred?.reference
   }
   if (saved?.conflict ?? inferred?.conflict) out.capabilityConflict = true
+  const st = ctx.get('settings')
+  const profile = st && (readProfile(readProviders(st), route) ?? readProfile(readDisabled(st), route))
+  const rawEntry = profile?.models?.find((model) => model && typeof model === 'object' && model.id === entry.id)
+  if (st && profile && rawEntry) {
+    try {
+      const binding = await resolvedImageVerificationBinding(ctx, profile, rawEntry)
+      const verification = savedImageVerification(st, route, profile, rawEntry, binding)
+      if (verification) out.capabilityVerification = verification
+    } catch { /* 凭据暂不可读时，不能把旧测试显示为当前连接的验证。 */ }
+  }
   return out
 }

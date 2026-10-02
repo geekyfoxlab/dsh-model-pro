@@ -36,6 +36,7 @@ export const METHODS: ReadonlyArray<readonly [string, string]> = [
   ['update-headers', 'updateHeaders'],
   ['apply-models', 'applyModels'],
   ['test-provider', 'testProvider'],
+  ['verify-image-input', 'verifyImageInput'],
   ['set-api-key', 'setApiKey'],
   ['list-routes', 'listRoutes'],
   ['set-route', 'setRoute'],

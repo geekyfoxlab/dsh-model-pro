@@ -127,6 +127,15 @@ export interface ProviderProfile {
 export type ModelInput = 'text' | 'image'
 export type ModelCapabilitySource = 'configured' | 'manual' | 'discovery' | 'catalog' | 'official' | 'provider-default'
 
+export interface ImageVerification {
+  status: 'verified' | 'unconfirmed'
+  checkedAt: string
+  passed: number
+  total: number
+  latencyMs: number
+  message?: string
+}
+
 export interface ModelCapabilitySummary {
   image: number
   text: number
@@ -149,6 +158,8 @@ export interface ModelEntry {
   capabilitySource?: ModelCapabilitySource
   capabilityConflict?: boolean
   capabilityReference?: string
+  /** 接口实测结果，单独保存到插件状态，不改变用户的能力声明。 */
+  capabilityVerification?: ImageVerification
   /** Optional wire model id different from `id`. */
   requestModel?: string
   [key: string]: unknown

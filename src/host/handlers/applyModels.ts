@@ -13,6 +13,7 @@ const sameInput = (a: unknown, b: unknown): boolean => normalizeModelInput(a)?.j
 const stripDisplay = (entry: ModelEntry): ModelEntry => {
   const out = { ...entry }
   delete out.capabilitySource; delete out.capabilityConflict; delete out.capabilityReference
+  delete out.capabilityVerification
   delete out.inputMode; delete out.inputModalities
   return out
 }

@@ -139,7 +139,7 @@ const uiPrefsState = { showRouteBadge: true }
 let modelState = [
   { id: 'deepseek-v4.1-flash', name: 'Legacy model', contextWindow: 128000, maxTokens: 4096, input: ['text'], requestModel: 'wire-chat', capabilitySource: 'configured' },
   { id: 'known-image-model', input: ['text', 'image'], capabilitySource: 'catalog', capabilityConflict: true, capabilityReference: 'Synthetic catalog reference' },
-  { id: 'custom-vision-name' },
+  { id: 'custom-vision-name', capabilityVerification: { status: 'verified', checkedAt: '2026-10-01T08:00:00.000Z', passed: 2, total: 2, latencyMs: 200 } },
 ]
 const discoveredState = [
   { id: 'remote-text', name: 'Remote text', input: ['text'] },
@@ -150,6 +150,9 @@ const remoteCalls = []
 let identifySummary = { image: 1, text: 1, unknown: 1, preserved: 1, updated: 1, rechecked: 2, conflicts: 1, catalogUnavailable: false }
 let identifyError = ''
 let providerRefreshError = ''
+let imageVerification = { status: 'verified', checkedAt: '2026-10-02T08:00:00.000Z', passed: 2, total: 2, latencyMs: 321 }
+let imageVerificationSaved = true
+let imageVerificationError = ''
 const businessFor = (method, payload) => {
   if (method === 'listProviders') return { ok: true, providers: testProviders, protocols: ['openai-completions', 'openai-responses', 'anthropic-messages'], writable: true }
   if (method === 'listRoutes') return { ok: true, routes: { auto: { strategy: 'priority', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }] } } }
@@ -157,6 +160,11 @@ const businessFor = (method, payload) => {
     ? { ok: false, error: providerRefreshError }
     : { ok: true, route: payload?.route || 'deepseek', models: modelState.map((m) => ({ ...m })), availableModels: [] }
   if (method === 'discoverModels') return { ok: true, models: discoveredState }
+  if (method === 'verifyImageInput') {
+    if (imageVerificationError) return { ok: false, error: imageVerificationError }
+    if (imageVerificationSaved) modelState = modelState.map((m) => m.id === payload.model ? { ...m, capabilityVerification: { ...imageVerification } } : m)
+    return { ok: true, model: payload.model, verification: { ...imageVerification }, saved: imageVerificationSaved, ...(!imageVerificationSaved ? { error: 'Synthetic verification save failure' } : {}) }
+  }
   if (method === 'applyModels') {
     // Identify has its own authoritative result; this client mock does not
     // repeat the host's catalog matching or preservation algorithm.
@@ -174,6 +182,7 @@ const businessFor = (method, payload) => {
         delete entry.capabilitySource
         delete entry.capabilityConflict
         delete entry.capabilityReference
+        delete entry.capabilityVerification
       }
       if (m.inputMode === 'manual') entry.capabilitySource = 'manual'
       delete entry.inputMode
@@ -204,7 +213,7 @@ const businessFor = (method, payload) => {
 // The remote handle: one async method per camelCase RPC name.
 const remoteMethods = [
   'listProviders', 'toggleProvider', 'getProvider', 'discoverModels', 'createProvider',
-  'deleteProvider', 'updateField', 'updateHeaders', 'applyModels', 'testProvider',
+  'deleteProvider', 'updateField', 'updateHeaders', 'applyModels', 'testProvider', 'verifyImageInput',
   'setApiKey', 'listRoutes', 'setRoute', 'deleteRoute', 'listComposites', 'setComposite',
   'deleteComposite', 'previewComposite', 'getRouteStats', 'listRequestLogs',
   'clearRequestLogs', 'probeTarget', 'probeAll', 'getUiPrefs', 'setUiPrefs',
@@ -221,7 +230,7 @@ const structures = []
 const fake = new FakeReact()
 const slotsByName = new Map()
 let registeredLocale = null
-const translatedKeys = new Set(['statusCapabilities', 'statusCapabilitiesCurrent', 'capabilitiesUnconfirmed', 'capabilityCatalogUnavailable', 'inputCapabilityHint', 'capabilitySourceConfigured', 'capabilitySourceManual', 'capabilitySourceCatalog', 'capabilitySourceOfficial', 'capabilitySourceProviderDefault', 'capabilitySourceDiscovery', 'capabilitySourceUnknown', 'capabilityReferenceLabel', 'capabilityConflictHint'])
+const translatedKeys = new Set(['statusCapabilities', 'statusCapabilitiesCurrent', 'capabilitiesUnconfirmed', 'capabilityCatalogUnavailable', 'inputCapabilityHint', 'capabilitySourceConfigured', 'capabilitySourceManual', 'capabilitySourceCatalog', 'capabilitySourceOfficial', 'capabilitySourceProviderDefault', 'capabilitySourceDiscovery', 'capabilitySourceUnknown', 'capabilityReferenceLabel', 'capabilityConflictHint', 'imageVerificationHint', 'imageVerificationNeedsImages', 'imageNotVerified', 'imageVerified', 'imageVerificationUnconfirmed', 'imageVerificationCheckedAt', 'statusImageVerified', 'statusImageUnconfirmed', 'imageVerificationNotSaved'])
 
 const ctx = {
   get: (name) => {
@@ -400,6 +409,14 @@ const settle = () => new Promise((r) => setTimeout(r, 10))
 const formControl = (nodes, tag, label) => nodes.find((n) => n.tag === tag && n.props?.['aria-label'] === label)
 const buttonByText = (nodes, text) => nodes.find((n) => n.tag === 'button' && n.text === text)
 const lastApply = () => remoteCalls.filter((c) => c.method === 'applyModels').at(-1)
+const verifyButton = (nodes, id) => formControl(nodes, 'button', `verifyImageInput: ${id}`)
+const verificationCalls = () => remoteCalls.filter((c) => c.method === 'verifyImageInput')
+const modelRow = (nodes, id) => nodes.find((n) => n.tag === 'tr' && n.text.includes(id))
+const modelInputBadge = (nodes, id) => {
+  const start = nodes.indexOf(modelRow(nodes, id))
+  const nextRow = nodes.findIndex((n, i) => i > start && n.tag === 'tr')
+  return nodes.slice(start + 1, nextRow < 0 ? nodes.length : nextRow).find((n) => n.tag === 'span' && n.className.includes('mpro-chip'))
+}
 let modelNodes = renderModels()
 assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputTextOnly'), 'known text models have a text-only badge')
 assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputTextImage'), 'known image models have an image-capability badge')
@@ -409,6 +426,13 @@ assert(formControl(modelNodes, 'select', 'inputCapabilityCol: deepseek-v4.1-flas
 assert(formControl(modelNodes, 'select', 'inputCapabilityCol: known-image-model')?.props.value === 'auto', 'catalog image capability stays in automatic mode')
 assert(modelNodes.some((n) => n.text === 'Old configuration (unknown source)') && modelNodes.some((n) => n.text === 'Model catalog'), 'model rows explain legacy and catalog capability sources')
 assert(modelNodes.some((n) => n.text.includes('Catalog labels differ')) && modelNodes.some((n) => n.text.includes('Synthetic catalog reference')), 'model rows display conflict and reference metadata')
+assert(verifyButton(modelNodes, 'known-image-model') && !verifyButton(modelNodes, 'known-image-model').props.disabled, 'declared image input enables a manual verification action')
+assert(verifyButton(modelNodes, 'deepseek-v4.1-flash').props.disabled && verifyButton(modelNodes, 'custom-vision-name').props.disabled, 'text-only and unknown models cannot send image verification requests')
+assert(verifyButton(modelNodes, 'known-image-model').props.title.includes('two synthetic image requests') && modelNodes.some((n) => n.text.includes('may incur a small charge')), 'the image verification request count and potential cost are visible before clicking')
+assert(modelRow(modelNodes, 'custom-vision-name').text.includes('Image input not tested') && !modelRow(modelNodes, 'custom-vision-name').text.includes('Image input verified'), 'a stale positive verification cannot label an unknown model as tested')
+assert(modelRow(modelNodes, 'custom-vision-name').text.includes('before verifying images'), 'unknown input explains that image permission must be saved before verification')
+verifyButton(modelNodes, 'custom-vision-name').onClick()
+assert(verificationCalls().length === 0, 'the verification handler also guards unknown input when invoked directly')
 
 // Manual capability is carried in the saved model, and automatic reset has an
 // explicit null rather than disappearing during JSON serialization.
@@ -416,6 +440,9 @@ formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name').onCh
 formControl(modelNodes, 'select', 'inputCapabilityCol: known-image-model').onChange({ target: { value: 'text' } })
 modelNodes = renderModels()
 assert(buttonByText(modelNodes, 'identifyCapabilities').props.disabled && buttonByText(modelNodes, 'identifyCapabilities').props.title === 'saveModelConfigFirst', 'capability backfill waits for unsaved manual choices')
+assert(verifyButton(modelNodes, 'known-image-model').props.disabled && verifyButton(modelNodes, 'known-image-model').props.title === 'saveModelConfigFirst', 'unsaved input changes prevent testing the previous declaration')
+verifyButton(modelNodes, 'known-image-model').onClick()
+assert(verificationCalls().length === 0, 'unsaved configuration is also guarded inside the verification handler')
 buttonByText(modelNodes, 'saveModelConfig').onClick()
 await settle()
 assert(JSON.stringify(lastApply().payload.models.find((m) => m.id === 'custom-vision-name').input) === JSON.stringify(['text', 'image']), 'manual image support is sent to apply-models')
@@ -459,11 +486,67 @@ assert(lastApply().payload.route === 'deepseek' && lastApply().payload.models.ev
 modelNodes = renderModels()
 const inlineStatus = (nodes) => nodes.find((n) => n.className.includes('mpro-inlineStatus'))
 assert(inlineStatus(modelNodes)?.text.includes('1 text + image, 1 text only, 1 unconfirmed') && inlineStatus(modelNodes).text.includes('Kept 1 existing settings; rechecked 2 models; updated 1 models; conflicting catalog labels: 1'), 'identify reports capability, existing-setting preservation, rechecked, updated and conflict counts')
-assert(modelNodes.some((n) => n.text === 'Official model reference (endpoint untested)') && modelNodes.some((n) => n.text.includes('Synthetic official model reference')), 'official metadata is visible without claiming an endpoint test')
+assert(modelNodes.some((n) => n.text === 'Official model reference (declared capability)') && modelNodes.some((n) => n.text.includes('Synthetic official model reference')), 'official metadata is visible as a capability declaration')
 assert(formControl(modelNodes, 'select', 'inputCapabilityCol: deepseek-v4.1-flash')?.props.value === 'auto', 'official image metadata remains automatic after re-identification')
 assert(inlineStatus(modelNodes).text.includes('Set unconfirmed input capabilities manually'), 'unknown models receive a manual-setting explanation')
 assert(!buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'identify button restores enabled state after success')
 assert(modelNodes.some((n) => n.text.includes('does not send an image test request')), 'catalog identification is distinguished from a real image test')
+
+// Verification is a separate explicit action. Only the host result changes
+// its badge; neither a declaration nor an unsuccessful attempt changes input.
+assert(modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Image input not tested'), 'an official image declaration is not represented as a live verification')
+verifyButton(modelNodes, 'deepseek-v4.1-flash').onClick()
+assert(verifyButton(renderModels(), 'deepseek-v4.1-flash').props.disabled, 'verification disables its button while the request is in flight')
+assert(formControl(renderModels(), 'input', 'reqModelField: deepseek-v4.1-flash').props.disabled, 'a pending verification prevents mapping edits that its model refresh could discard')
+await settle()
+assert(JSON.stringify(verificationCalls().at(-1).payload) === JSON.stringify({ route: 'deepseek', model: 'deepseek-v4.1-flash' }), 'verification sends only the provider route and selected model ID')
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusOk') && inlineStatus(modelNodes).text.includes('2/2 checks passed in 321 ms'), 'saved verified response displays check counts and latency')
+assert(modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Image input verified') && modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes(imageVerification.checkedAt), 'the refreshed model displays a positive result and its checked time')
+assert(modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Official model reference (declared capability)') && formControl(modelNodes, 'select', 'inputCapabilityCol: deepseek-v4.1-flash').props.value === 'auto', 'live verification preserves the declaration source and automatic setting')
+assert(!verifyButton(modelNodes, 'deepseek-v4.1-flash').props.disabled, 'verification restores its enabled state after success')
+buttonByText(modelNodes, 'saveModelConfig').onClick()
+await settle()
+assert(lastApply().payload.models.every((m) => !Object.hasOwn(m, 'capabilityVerification')), 'ordinary model save never persists a displayed verification into provider configuration')
+
+imageVerification = { status: 'unconfirmed', checkedAt: '2026-10-02T08:01:00.000Z', passed: 1, total: 2, latencyMs: 444, message: 'Synthetic image answer mismatch' }
+modelNodes = renderModels()
+verifyButton(modelNodes, 'deepseek-v4.1-flash').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes('1/2 checks passed') && inlineStatus(modelNodes).text.includes(imageVerification.message), 'an answer mismatch produces a visible unconfirmed result with check counts')
+assert(modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Image verification unconfirmed') && modelInputBadge(modelNodes, 'deepseek-v4.1-flash').text === 'inputTextImage', 'an unconfirmed attempt does not downgrade the declared image capability to text only')
+
+imageVerification = { ...imageVerification, passed: 0, checkedAt: '2026-10-02T08:02:00.000Z', message: 'Synthetic image request timeout' }
+verifyButton(modelNodes, 'deepseek-v4.1-flash').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes).text.includes('0/2 checks passed') && inlineStatus(modelNodes).text.includes('Synthetic image request timeout') && modelInputBadge(modelNodes, 'deepseek-v4.1-flash').text === 'inputTextImage', 'a network failure remains unconfirmed while retaining the image declaration')
+
+imageVerificationError = 'Synthetic missing image-test credentials'
+verifyButton(modelNodes, 'deepseek-v4.1-flash').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes(imageVerificationError), 'verification business failures are visible in the current model editor')
+assert(!verifyButton(modelNodes, 'deepseek-v4.1-flash').props.disabled, 'verification restores its enabled state after a business failure')
+imageVerificationError = ''
+
+imageVerification = { status: 'verified', checkedAt: '2026-10-02T08:03:00.000Z', passed: 2, total: 2, latencyMs: 555 }
+imageVerificationSaved = false
+verifyButton(modelNodes, 'deepseek-v4.1-flash').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes('2/2 checks passed') && inlineStatus(modelNodes).text.includes('result was not saved') && inlineStatus(modelNodes).text.includes('Synthetic verification save failure'), 'completed verification with saved:false is not reported as a saved success')
+assert(modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Image verification unconfirmed') && !modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes(imageVerification.checkedAt), 'an unsaved positive result cannot replace the persisted verification badge')
+imageVerificationSaved = true
+
+providerRefreshError = 'Synthetic verification refresh failure'
+verifyButton(modelNodes, 'deepseek-v4.1-flash').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes(providerRefreshError), 'a failed refresh after verification reports a visible error')
+assert(!verifyButton(modelNodes, 'deepseek-v4.1-flash').props.disabled, 'a verification refresh failure restores the button state')
+providerRefreshError = ''
 
 // A successful write with zero recognized models must describe that outcome.
 identifySummary = { image: 0, text: 0, unknown: 3, preserved: 0, updated: 0, catalogUnavailable: false }
@@ -473,6 +556,7 @@ await settle()
 modelNodes = renderModels()
 assert(inlineStatus(modelNodes)?.text.includes('0 text + image, 0 text only, 3 unconfirmed') && inlineStatus(modelNodes).text.includes('updated 0 models'), 'all-unknown zero-update outcome is visible rather than a generic total model count')
 assert(inlineStatus(modelNodes).text.includes('rechecked 0 models') && inlineStatus(modelNodes).text.includes('conflicting catalog labels: 0'), 'older summaries without new fields display zero rather than undefined')
+assert(verifyButton(modelNodes, 'deepseek-v4.1-flash').props.disabled && modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Image input not tested') && !modelRow(modelNodes, 'deepseek-v4.1-flash').text.includes('Image input verified'), 'an old verified result is ignored after the model capability becomes unknown')
 
 identifySummary = { ...identifySummary, catalogUnavailable: true }
 buttonByText(modelNodes, 'identifyCapabilities').onClick()
