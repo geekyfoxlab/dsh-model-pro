@@ -1120,4 +1120,125 @@ await P('delete-provider', { route: 'comp-b' })
   for (const cleanup of modernCleanups.splice(0).reverse()) await cleanup()
 }
 
-console.log('PASS: host end-to-end smoke — legacy and Harness 0.2 assertions green')
+// 多模态必须落到配置 input，不能只让 UI 看起来支持图片。
+{
+  const initialCaps = { providers: {
+    gateway: { api: 'openai-completions', baseURL: 'https://gateway.invalid/v1', models: [
+      { id: 'known-image' }, { id: 'alias', requestModel: 'known-image' },
+      { id: 'alias-edit', requestModel: 'known-image' }, { id: 'manual', input: ['text'] },
+      { id: 'conflicting' }, { id: 'unsupported-conflict' }, { id: 'unknown-vision-name' },
+    ] },
+    text: { api: 'openai-completions', baseURL: 'https://text.invalid/v1', models: [{ id: 'same', input: ['text'] }] },
+    vision: { api: 'openai-completions', baseURL: 'https://vision.invalid/v1', models: [{ id: 'same', input: ['text', 'image'] }] },
+    unknown: { api: 'openai-completions', baseURL: 'https://unknown.invalid/v1', models: [{ id: 'same' }] },
+    'image-default': { defaultInput: ['text', 'image'], models: [{ id: 'known-text' }] },
+    'text-default': { defaultInput: ['text'], models: [{ id: 'known-image' }] },
+    'catalog-a': { defaultInput: ['text', 'image'], models: [{ id: 'known-text' }] },
+  } }
+  const capStore = createSettings(initialCaps)
+  const capLog = { section: () => capStore.doc() }
+  const capLlm = createLlm(capLog)
+  const catalogCalls = []
+  capLlm.listConfigurableProviders = () => ['catalog-a', 'catalog-b'].map((provider) => ({ settingsNs: 'llm-pi-ai', provider, declared: false }))
+  capLlm.discoverModels = async (_ns, request) => {
+    if (!request.baseURL) {
+      catalogCalls.push(request)
+      assert(!request.apiKey && request.provider.startsWith('catalog-'), 'catalog inference never supplies endpoint or credentials')
+      return [
+        { id: 'known-image', name: 'Known image', inputModalities: ['text', 'image'] },
+        { id: 'manual', name: 'Manual override', inputModalities: ['text', 'image'] },
+        { id: 'known-text', name: 'Known text', inputModalities: ['text'] },
+        { id: 'conflicting', name: 'Conflict', inputModalities: request.provider === 'catalog-a' ? ['text'] : ['text', 'image'] },
+        { id: 'unsupported-conflict', name: 'Unsupported conflict', inputModalities: request.provider === 'catalog-a' ? ['text', 'audio'] : ['text'] },
+      ]
+    }
+    return [
+      { id: 'known-image', name: 'Listed image' },
+      { id: 'remote-image', name: 'Remote metadata', inputModalities: ['text', 'image'] },
+      { id: 'remote-text', name: 'Remote text', inputModalities: ['text'] },
+      { id: 'new-vision-name', name: 'Unknown' },
+    ]
+  }
+  capLlm.resolveModelInfo = async (provider, id) => ({ provider, id, name: id, inputModalities: ['text'] })
+  const capCleanups = []
+  const capCtx = { get(name) { return name === 'settings' ? capStore : name === 'llm' ? capLlm : undefined },
+    typert: { register: () => () => {} }, on: () => () => {},
+    effect(fn) { const cleanup = fn(); if (typeof cleanup === 'function') capCleanups.push(cleanup) },
+  }
+  const capHost = await loadHost()
+  capHost.apply(capCtx)
+  const call = (method, args = {}) => capHost.runtimes.at(-1)[kebabToCamel(method)](args)
+  const beforeRead = JSON.stringify(capStore.doc())
+  let result = await call('get-provider', { route: 'gateway' })
+  const byId = new Map(result.models.map((entry) => [entry.id, entry]))
+  assert(byId.get('known-image').input.includes('image') && byId.get('known-image').capabilitySource === 'catalog', 'exact catalog id identifies image input on custom route')
+  assert(byId.get('alias').input.includes('image'), 'wire model identity is used for local aliases')
+  assert(byId.get('manual').input.join() === 'text', 'manual text-only input wins over catalog')
+  assert(!byId.get('conflicting').input && !byId.get('unknown-vision-name').input, 'ambiguous or unknown vision-looking names stay unconfirmed')
+  assert(!byId.get('unsupported-conflict').input, 'unsupported same-name catalog entry prevents a false text-only inference')
+  assert(JSON.stringify(capStore.doc()) === beforeRead, 'reading capabilities does not mutate provider configuration')
+  assert((await call('get-provider', { route: 'image-default' })).models[0].input.includes('image'), 'declared provider image default wins over a different provider catalog')
+  assert((await call('get-provider', { route: 'text-default' })).models[0].input.join() === 'text', 'declared provider text default is preserved')
+  assert((await call('get-provider', { route: 'catalog-a' })).models[0].input.join() === 'text', 'same-provider catalog precedes provider default, matching Harness resolution')
+  result = await call('apply-models', { route: 'gateway', models: [{ ...byId.get('alias-edit'), requestModel: 'known-text' }], mode: 'merge' })
+  assert(result.ok && capStore.doc().providers.gateway.models.find((entry) => entry.id === 'alias-edit').input.join() === 'text', 'editing an unsaved inferred alias re-identifies the new wire model')
+  byId.delete('alias-edit')
+  result = await call('discover-models', { route: 'gateway' })
+  assert(result.models.find((entry) => entry.id === 'remote-image').input.includes('image'), 'discovery preserves framework inputModalities')
+  assert(result.models.find((entry) => entry.id === 'remote-text').input.join() === 'text', 'remote text metadata is distinguished from unknown')
+  assert(!result.models.find((entry) => entry.id === 'new-vision-name').input, 'remote unknown stays unconfirmed')
+  result = await call('apply-models', { route: 'gateway', models: [...byId.values()], mode: 'merge' })
+  assert(result.ok && capStore.doc().providers.gateway.models.find((entry) => entry.id === 'known-image').input.includes('image'), 'identified capability is persisted to Harness input field')
+  assert(!JSON.stringify(capStore.doc()).includes('capabilitySource'), 'display-only capability source never leaks into configuration')
+  await call('apply-models', { route: 'gateway', models: [{ id: 'manual', input: ['text', 'image'], capabilitySource: 'discovery' }], mode: 'merge' })
+  assert(capStore.doc().providers.gateway.models.find((entry) => entry.id === 'manual').input.join() === 'text', 'automatic refresh preserves confirmed text-only choice')
+  await call('apply-models', { route: 'gateway', models: [{ id: 'manual', input: null }], mode: 'merge' })
+  assert(capStore.doc().providers.gateway.models.find((entry) => entry.id === 'manual').input.includes('image'), 'automatic reset removes override and re-identifies capability')
+  await call('apply-models', { route: 'gateway', models: [{ id: 'manual', input: ['text'] }], mode: 'merge' })
+  result = await call('apply-models', { route: 'gateway', models: capStore.doc().providers.gateway.models.map((entry) => entry.id === 'manual' ? { ...entry, input: null, capabilitySource: 'catalog' } : entry), mode: 'replace' })
+  assert(result.ok && capStore.doc().providers.gateway.models.find((entry) => entry.id === 'manual').input.includes('image'), 'replace reset takes priority over prior input and display source')
+  await call('apply-models', { route: 'gateway', models: [{ id: 'alias', input: ['text'], requestModel: null }], mode: 'merge' })
+  assert(!capStore.doc().providers.gateway.models.find((entry) => entry.id === 'alias').requestModel, 'clearing wire mapping persists')
+  const beforeInvalid = JSON.stringify(capStore.doc())
+  for (const input of [[], ['audio'], ['text', 'video'], 'image']) {
+    result = await call('apply-models', { route: 'gateway', models: [{ id: 'known-image', input }], mode: 'merge' })
+    assert(!result.ok && JSON.stringify(capStore.doc()) === beforeInvalid, 'invalid/unsupported input fails without writing')
+  }
+  await call('toggle-provider', { route: 'gateway', enabled: false })
+  await call('apply-models', { route: 'gateway', models: [{ id: 'known-image', input: ['text'] }], mode: 'merge' })
+  assert(capStore.doc().disabledProviders.gateway.models.find((entry) => entry.id === 'known-image').input.join() === 'text', 'disabled provider capability remains editable')
+  assert(catalogCalls.length === 2, 'catalog identity index is reused without repeated discovery')
+
+  let ready = false
+  let failCatalog = true
+  const retryLlm = { ...capLlm,
+    listConfigurableProviders: () => ready ? [{ settingsNs: 'llm-pi-ai', provider: 'catalog-a', declared: false }] : [],
+    discoverModels: async (...args) => { if (failCatalog) throw new Error('catalog not ready'); return capLlm.discoverModels(...args) },
+  }
+  const retryStore = createSettings({ providers: { retry: { models: [{ id: 'known-image' }] } } })
+  const retryHost = await loadHost()
+  retryHost.apply({ ...capCtx, get: (name) => name === 'settings' ? retryStore : name === 'llm' ? retryLlm : undefined })
+  const retryRpc = retryHost.runtimes.at(-1)
+  assert(!(await retryRpc.getProvider({ route: 'retry' })).models[0].input, 'pre-ready empty catalog stays unknown')
+  ready = true
+  assert(!(await retryRpc.getProvider({ route: 'retry' })).models[0].input, 'temporary catalog failure stays unknown')
+  failCatalog = false
+  assert((await retryRpc.getProvider({ route: 'retry' })).models[0].input.includes('image'), 'empty and failed catalog caches can recover without restart')
+
+  await call('set-route', { alias: 'mixed-image', targets: [{ provider: 'text', model: 'same' }, { provider: 'vision', model: 'same' }] })
+  await call('set-route', { alias: 'only-text', targets: [{ provider: 'text', model: 'same' }] })
+  await call('set-route', { alias: 'partly-unknown', targets: [{ provider: 'text', model: 'same' }, { provider: 'unknown', model: 'same' }] })
+  const adapter = capLlm.registrations.find((entry) => entry.providers.includes('router')).adapter
+  const advertised = await adapter.listModels('router')
+  assert(advertised.find((entry) => entry.id === 'mixed-image').inputModalities.includes('image'), 'virtual route advertises union so Harness does not strip images early')
+  assert((await adapter.resolveModel('router', 'mixed-image')).inputModalities.includes('image'), 'virtual resolution overrides first text-only target capability')
+  assert(!(await adapter.resolveModel('router', 'partly-unknown')).inputModalities, 'unknown target prevents false text-only virtual declaration')
+  const imageMessages = [{ role: 'user', content: [{ type: 'text', text: 'describe' }, { type: 'image', data: 'synthetic-image', mimeType: 'image/png' }] }]
+  for await (const _chunk of adapter.stream({ provider: 'router', model: 'mixed-image', messages: imageMessages })) { /* drain */ }
+  assert(capLog.lastConfig.provider === 'vision', 'image routing skips confirmed text-only target')
+  assert(capLog.lastStreamOpts.messages === imageMessages, 'image blocks remain intact when forwarding to compatible target')
+  await assertStrict.rejects(async () => { for await (const _chunk of adapter.stream({ provider: 'router', model: 'only-text', messages: imageMessages })) { /* drain */ } }, /图片|image/)
+  for (const cleanup of capCleanups.splice(0).reverse()) await cleanup()
+}
+
+console.log('PASS: host end-to-end smoke — legacy, Harness 0.2 and multimodal assertions green')

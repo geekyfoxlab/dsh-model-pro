@@ -19,7 +19,7 @@
     "prepare": "test -f src/host/index.ts && npm run build || true",
     "prepublishOnly": "npm run build && npm test",
     "release": "node scripts/release.mjs",
-    "test:runtime": "node tests/runtime.compat.mjs"
+    "test:runtime": "node tests/runtime.compat.mjs && node tests/runtime.multimodal.mjs"
   },
   "keywords": [
     "dsh",

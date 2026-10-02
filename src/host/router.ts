@@ -18,12 +18,31 @@
  */
 
 import type { HostCtx } from './utils'
-import { readRoutes, wireModelOf } from './utils'
+import { readProviders, readProfile, readRoutes, wireModelOf } from './utils'
 import { ROUTER_ROUTE, COMPOSITE_ROUTE, COMPOSITE_SEP, DEFAULT_ROUTE_STRATEGY } from '../shared/constants'
-import type { RouteSpec, RouteTarget, RouteStrategy, TargetHealth } from '../shared/types'
+import type { ModelInput, ModelEntry, RouteSpec, RouteTarget, RouteStrategy, TargetHealth } from '../shared/types'
 import { readComposites, decodeCompositeModel, compositeTargetsFor, resolveCompositeModels } from './composite'
 import { getHealthTracker } from './health'
 import { getStatsRecorder } from './statsStore'
+import { resolveModelInput } from './modelCapabilities'
+
+type RouterModel = {
+  provider: string
+  id: string
+  name: string
+  description?: string
+  inputModalities?: ModelInput[]
+}
+
+function messagesHaveImage(messages: unknown): boolean {
+  return Array.isArray(messages) && messages.some((message: unknown) => {
+    if (!message || typeof message !== 'object') return false
+    const content = (message as Record<string, unknown>).content
+    return Array.isArray(content) && content.some((block: unknown) =>
+      !!block && typeof block === 'object' && (block as Record<string, unknown>).type === 'image',
+    )
+  })
+}
 
 type LlmLike = {
   registerAdapter(providers: string[], adapter: unknown): () => void
@@ -239,25 +258,57 @@ export function makeRouterAdapter(ctx: HostCtx): unknown {
     return { spec, routeName: `${dec.composite}::${dec.model}` }
   }
 
+  const targetInput = async (target: RouteTarget): Promise<ModelInput[] | undefined> => {
+    const profile = readProfile(readProviders(st()), target.provider)
+    const configured = profile?.models?.find((model) => model.id === target.model)
+    const overrides = profile?.modelOverrides
+    const override = overrides && typeof overrides === 'object' && !Array.isArray(overrides)
+      ? (overrides as Record<string, unknown>)[target.model]
+      : undefined
+    const entry: ModelEntry = configured ?? {
+      ...(override && typeof override === 'object' && !Array.isArray(override) ? override : {}),
+      id: target.model,
+    }
+    try {
+      return await resolveModelInput(ctx, target.provider, entry)
+    } catch {
+      return undefined
+    }
+  }
+
+  // 虚拟路由先进入 Harness 的能力检查；只读第一个目标会提前把图片剥成文本。
+  // 能力明确时取所有启用目标的并集，有未知目标则保留未知，由实际目标决定。
+  const aggregateInput = async (targets: RouteTarget[]): Promise<ModelInput[] | undefined> => {
+    const enabled = targets.filter((target) => target.enabled !== false)
+    if (!enabled.length) return undefined
+    const inputs = await Promise.all(enabled.map(targetInput))
+    if (inputs.some((input) => input === undefined)) return undefined
+    return [...new Set(inputs.flatMap((input) => input ?? []))]
+  }
+
   /** 24h-ish cursor key for round-robin/weighted state (per route identity). */
   const cursor: Record<string, number[]> = {}
   const pin: Record<string, RouteTarget> = {}
 
-  return {
+  const adapter = {
     providerInfo(provider: string) {
       return { id: provider, name: provider === COMPOSITE_ROUTE ? '组合提供商' : '智能路由' }
     },
     providerRetryPolicy() {
       return undefined
     },
+    imageRequestPricing() {
+      return undefined
+    },
     async listModels(provider: string) {
-      const out: Array<{ provider: string; id: string; name: string; description?: string }> = []
+      const out: RouterModel[] = []
       if (provider === COMPOSITE_ROUTE) {
         for (const name of Object.keys(readComposites(ctx))) {
           const res = await resolveCompositeModels(ctx, name)
           if (!res.ok) continue
           for (const id of res.ids) {
-            out.push({ provider, id: `${name}${COMPOSITE_SEP}${id}`, name: id, description: `${name} · ${res.mode}` })
+            const inputModalities = await aggregateInput(compositeTargetsFor(ctx, name, id))
+            out.push({ provider, id: `${name}${COMPOSITE_SEP}${id}`, name: id, description: `${name} · ${res.mode}`, ...(inputModalities === undefined ? {} : { inputModalities }) })
           }
         }
         return dedupeModels(out)
@@ -267,7 +318,8 @@ export function makeRouterAdapter(ctx: HostCtx): unknown {
       for (const name of Object.keys(routes)) {
         const spec = routeOf(name)
         if (!spec) continue
-        out.push({ provider, id: name, name, description: `${spec.strategy} · ${spec.targets.length} 个目标` })
+        const inputModalities = await aggregateInput(spec.targets)
+        out.push({ provider, id: name, name, description: `${spec.strategy} · ${spec.targets.length} 个目标`, ...(inputModalities === undefined ? {} : { inputModalities }) })
       }
       return out
     },
@@ -280,14 +332,28 @@ export function makeRouterAdapter(ctx: HostCtx): unknown {
       } else {
         spec = routeOf(model)
       }
-      if (!spec || !llm || !spec.targets.length) return base
-      const first = spec.targets[0]
-      try {
-        const wire = wireModelOf(st(), first.provider, first.model)
-        const info = await llm.resolveModelInfo(first.provider, wire, signal)
-        return { ...info, provider, id: model, name: model }
-      } catch {
-        return base
+      if (!spec || !spec.targets.length) return base
+      const inputModalities = await aggregateInput(spec.targets)
+      const result: Record<string, unknown> = { ...base }
+      const first = spec.targets.find((target) => target.enabled !== false)
+      if (llm && first) {
+        try {
+          const wire = wireModelOf(st(), first.provider, first.model)
+          Object.assign(result, await llm.resolveModelInfo(first.provider, wire, signal), base)
+        } catch { /* 目标其他元数据不可读时仍保留聚合能力。 */ }
+      }
+      delete result.inputModalities
+      if (inputModalities !== undefined) result.inputModalities = inputModalities
+      return result
+    },
+    // Harness 0.2 通过 prepareCall 绑定能力与派发；普通对象适配器没有基类默认实现。
+    async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<{
+      model: Record<string, unknown>
+      stream: (options: Record<string, any>) => AsyncIterable<unknown>
+    }> {
+      return {
+        model: await this.resolveModel(provider, model, signal),
+        stream: (options: Record<string, any>) => this.stream(options),
       }
     },
     async *stream(options: Record<string, any>): AsyncIterable<unknown> {
@@ -310,7 +376,12 @@ export function makeRouterAdapter(ctx: HostCtx): unknown {
         : spec.targets.length
 
       // Healthy + enabled candidate list (skip probe-down unless everything is).
-      const candidates = spec.targets.filter((t) => t.enabled !== false)
+      let candidates = spec.targets.filter((t) => t.enabled !== false)
+      if (messagesHaveImage(options.messages)) {
+        const inputs = await Promise.all(candidates.map(targetInput))
+        candidates = candidates.filter((_, index) => inputs[index] === undefined || inputs[index]?.includes('image'))
+        if (!candidates.length) throw new Error(`智能路由「${model}」没有支持图片输入的可用目标`)
+      }
       const healthFiltered = healthAware
         ? candidates.filter((t) => health().isHealthy(t.provider, t.model))
         : candidates
@@ -531,6 +602,7 @@ export function makeRouterAdapter(ctx: HostCtx): unknown {
       }
     },
   }
+  return adapter
 }
 
 async function tryReturn(iterator: AsyncIterator<unknown>): Promise<void> {
@@ -539,7 +611,7 @@ async function tryReturn(iterator: AsyncIterator<unknown>): Promise<void> {
   } catch { /* best effort */ }
 }
 
-function dedupeModels(arr: Array<{ provider: string; id: string; name: string; description?: string }>) {
+function dedupeModels(arr: RouterModel[]) {
   const seen = new Set<string>()
   return arr.filter((m) => {
     if (seen.has(m.id)) return false

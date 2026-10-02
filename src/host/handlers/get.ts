@@ -4,6 +4,7 @@ import { readProviders, readDisabled, readProfile } from '../utils'
 import type { HostCtx } from '../utils'
 import type { HeaderPair } from '../../shared/types'
 import { decryptSecret } from '../crypto'
+import { describeModelInput } from '../modelCapabilities'
 
 export async function getProvider(ctx: HostCtx, args: { route?: string; includeSecret?: boolean }) {
   const st = ctx.get('settings')
@@ -23,7 +24,7 @@ export async function getProvider(ctx: HostCtx, args: { route?: string; includeS
       : []
   const hasExplicit = Array.isArray(p.models) && p.models.length > 0
   const models = hasExplicit
-    ? p.models!.map((m) => (m && typeof m === 'object' ? { ...m } : { id: String(m) }))
+    ? await Promise.all(p.models!.map((m) => describeModelInput(ctx, route, m && typeof m === 'object' ? { ...m } : { id: String(m) })))
     : []
 
   // Advertised model ids for the test dropdown (advisory; may be empty). For a

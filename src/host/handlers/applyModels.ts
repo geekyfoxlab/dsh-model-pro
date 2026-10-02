@@ -4,15 +4,40 @@ import { NS } from '../../shared/constants'
 import type { HostCtx } from '../utils'
 import { readProviders, readDisabled, readProfile, checkWritable, writeSection } from '../utils'
 import type { ModelEntry } from '../../shared/types'
+import { normalizeModelInput, resolveModelInput } from '../modelCapabilities'
 
 type ApplyMode = 'replace' | 'merge' | 'remove'
 
-const toEntry = (m: any): ModelEntry =>
-  m && typeof m === 'object' ? { ...m } : { id: String(m) }
+const toEntry = (m: unknown): ModelEntry =>
+  m && typeof m === 'object' && !Array.isArray(m) ? { ...m } as ModelEntry : { id: String(m) }
+
+const wireId = (entry: ModelEntry): string => entry.requestModel?.trim() || entry.id
+
+function patchEntry(raw: unknown, previous?: ModelEntry): ModelEntry {
+  const patch = toEntry(raw)
+  if (typeof patch.id !== 'string' || !patch.id.trim()) throw new Error('模型 ID 必须是非空字符串')
+  const incoming = patch as Record<string, unknown>
+  if (incoming.input != null && !normalizeModelInput(incoming.input)) throw new Error('输入能力只支持非空的 text / image 列表')
+  if (incoming.requestModel != null && typeof incoming.requestModel !== 'string') throw new Error('转发名必须是字符串')
+  const resetInput = incoming.input === null
+  const resetWire = incoming.requestModel === null
+  if (incoming.input == null) delete patch.input
+  if (incoming.requestModel == null) delete patch.requestModel
+  const next = { ...previous, ...patch }
+  // 目录刷新不能覆盖手动确认过的模型能力；自动重置由显式 null 请求。
+  if (!resetInput && (patch.capabilitySource === 'catalog' || patch.capabilitySource === 'discovery') && normalizeModelInput(previous?.input)) next.input = previous!.input
+  if (resetInput) delete next.input
+  if (resetWire) delete next.requestModel
+  // 未保存的目录识别属于旧转发型号，修改转发名后必须重新识别。
+  if (previous && patch.capabilitySource === 'catalog' && !normalizeModelInput(previous.input) && wireId(previous) !== wireId(next)) delete next.input
+  delete next.capabilitySource
+  delete next.inputModalities
+  return next
+}
 
 export async function applyModels(
   ctx: HostCtx,
-  args: { route?: string; models?: any[]; mode?: string },
+  args: { route?: string; models?: unknown[]; mode?: string },
 ) {
   const st = ctx.get('settings')
   if (st === undefined) return { ok: false as const, error: 'settings 服务不可用' }
@@ -33,21 +58,43 @@ export async function applyModels(
   const existing = Array.isArray(p.models) ? p.models.map(toEntry) : []
 
   let next: ModelEntry[]
-  if (mode === 'replace') {
-    next = models.map(toEntry)
-  } else if (mode === 'merge') {
-    next = [...existing]
-    for (const m of models) {
-      const e = toEntry(m)
-      const idx = next.findIndex((x) => x.id === e.id)
-      if (idx >= 0) next[idx] = { ...next[idx], ...e }
-      else next.push(e)
+  try {
+    if (mode === 'replace') {
+      next = models.map((m) => {
+        const patch = toEntry(m)
+        const prior = existing.find((e) => e.id === patch.id)
+        const entry = patchEntry(m)
+        if (patch.input !== null && (patch.capabilitySource === 'catalog' || patch.capabilitySource === 'discovery') && normalizeModelInput(prior?.input)) entry.input = prior!.input
+        if (prior && patch.capabilitySource === 'catalog' && !normalizeModelInput(prior.input) && wireId(prior) !== wireId(entry)) delete entry.input
+        return entry
+      })
+    } else if (mode === 'merge') {
+      next = [...existing]
+      for (const m of models) {
+        const e = toEntry(m)
+        const idx = next.findIndex((x) => x.id === e.id)
+        if (idx >= 0) next[idx] = patchEntry(m, next[idx])
+        else next.push(patchEntry(m))
+      }
+    } else if (mode === 'remove') {
+      const toRemove = new Set(models.map((m) => toEntry(m).id))
+      next = existing.filter((m) => !toRemove.has(m.id))
+    } else {
+      return { ok: false as const, error: `未知 mode: ${mode}` }
     }
-  } else if (mode === 'remove') {
-    const toRemove = new Set(models.map((m) => (m && typeof m === 'object' ? m.id : String(m))))
-    next = existing.filter((m) => !toRemove.has(m.id))
-  } else {
-    return { ok: false as const, error: `未知 mode: ${mode}` }
+    if (mode !== 'remove') {
+      next = await Promise.all(next.map(async (entry) => {
+        const input = await resolveModelInput(ctx, route, entry)
+        const saved = { ...entry }
+        delete saved.capabilitySource
+        delete saved.inputModalities
+        delete saved.input
+        if (input) saved.input = [...input]
+        return saved
+      }))
+    }
+  } catch (err) {
+    return { ok: false as const, error: String((err as Error)?.message || err) }
   }
 
   // Prevent removing all models from custom providers

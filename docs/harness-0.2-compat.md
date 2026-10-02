@@ -25,6 +25,8 @@ Host 冒烟测试覆盖旧版和新版设置接口、供应商增删改、请求
 
 tests/runtime.compat.mjs 使用 Harness 自带的 TypertRegistry、SettingsForms、PiConfig 和 Cordis。配置编辑器与凭据服务均为内存替身，不访问真实供应商配置或凭据。此检查需要本机可用的 Harness 运行时，未加入默认 npm test。
 
+tests/runtime.multimodal.mjs 额外验证真实 PiAiAdapter 的图片能力及附件转换、LlmRuntime 的智能路由/组合能力、图片目标筛选。底层推理流使用内存替身，不向外部供应商发送请求。配置测试也覆盖 input 的保存、禁用/启用及卸载恢复。
+
 ```sh
 DSH_RUNTIME_ROOT=/path/to/dsh npm run test:runtime
 ```
@@ -34,6 +36,8 @@ DSH_RUNTIME_ROOT 指向包含 node_modules/@deepseek-ai 的 Harness 运行时目
 ```sh
 ELECTRON_RUN_AS_NODE=1 DSH_RUNTIME_ROOT=/path/to/app.asar/dsh \
   /path/to/electron --expose-internals tests/runtime.compat.mjs
+ELECTRON_RUN_AS_NODE=1 DSH_RUNTIME_ROOT=/path/to/app.asar/dsh \
+  /path/to/electron --expose-internals tests/runtime.multimodal.mjs
 ```
 
 测试默认在 VM 中加载构建后的 host。可设置 MODEL_PRO_ACTUAL_PLUGIN 为能够解析该 Harness 框架依赖的 dist/host.js 绝对路径，额外验证真实插件 fiber 的启动、卸载和重装。可设置 MODEL_PRO_HOST_BUNDLE 指向旧版 1.1.8 的 host bundle，并配合 EXPECT_INCOMPATIBLE=1 重现缺少 codec.create() 的原始错误。

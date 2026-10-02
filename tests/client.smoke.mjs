@@ -82,8 +82,8 @@ function renderAt(rootVNode, fake, path, out) {
     return
   }
   if (typeof type === 'string') {
-    // Keep clickable elements so the test can drive tab switches.
-    out.push({ tag: type, className: props?.className || '', text: collectText(children), onClick: props?.onClick })
+    // Keep form events and values too, so capability changes exercise the RPC.
+    out.push({ tag: type, className: props?.className || '', text: collectText(children), onClick: props?.onClick, onChange: props?.onChange, props })
     for (let i = 0; i < children.length; i++) renderAt(children[i], fake, `${path}:${i}`, out)
     return
   }
@@ -136,10 +136,38 @@ const testProviders = [
 // { ok, value } wrapping the business { ok, ... } payload.
 // ---------------------------------------------------------------------------
 const uiPrefsState = { showRouteBadge: true }
+let modelState = [
+  { id: 'deepseek-chat', input: ['text'], requestModel: 'wire-chat' },
+  { id: 'known-image-model', input: ['text', 'image'], capabilitySource: 'catalog' },
+  { id: 'custom-vision-name' },
+]
+const discoveredState = [
+  { id: 'remote-text', name: 'Remote text', input: ['text'] },
+  { id: 'remote-image', name: 'Remote image', input: ['text', 'image'] },
+  { id: 'unknown-vision', name: 'Unknown vision' },
+]
+const remoteCalls = []
 const businessFor = (method, payload) => {
   if (method === 'listProviders') return { ok: true, providers: testProviders, protocols: ['openai-completions', 'openai-responses', 'anthropic-messages'], writable: true }
   if (method === 'listRoutes') return { ok: true, routes: { auto: { strategy: 'priority', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }] } } }
-  if (method === 'getProvider') return { ok: true, models: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }], availableModels: [] }
+  if (method === 'getProvider') return { ok: true, models: modelState.map((m) => ({ ...m })), availableModels: [] }
+  if (method === 'discoverModels') return { ok: true, models: discoveredState }
+  if (method === 'applyModels') {
+    const incoming = (payload.models || []).map((m) => {
+      const entry = { ...m }
+      if (entry.input === null) delete entry.input
+      if (entry.requestModel === null) delete entry.requestModel
+      return entry
+    })
+    if (payload.mode === 'replace') modelState = incoming
+    else if (payload.mode === 'remove') modelState = modelState.filter((m) => !incoming.some((other) => other.id === m.id))
+    else {
+      const entries = new Map(modelState.map((m) => [m.id, m]))
+      for (const m of incoming) entries.set(m.id, m)
+      modelState = [...entries.values()]
+    }
+    return { ok: true, count: modelState.length }
+  }
   if (method === 'listComposites') return { ok: true, composites: {} }
   if (method === 'getRouteStats') return {
     ok: true,
@@ -163,7 +191,10 @@ const remoteMethods = [
 ]
 const remoteHandle = {}
 for (const m of remoteMethods) {
-  remoteHandle[m] = async (payload) => ({ ok: true, value: businessFor(m, payload) })
+  remoteHandle[m] = async (payload) => {
+    remoteCalls.push({ method: m, payload: payload && JSON.parse(JSON.stringify(payload)) })
+    return { ok: true, value: businessFor(m, payload) }
+  }
 }
 
 const structures = []
@@ -338,6 +369,63 @@ renderAt(tree, fake, 'root', outM)
 const searchInputs = outM.filter((n) => n.tag === 'input' && String(n.className).includes('mpro-searchInput'))
 assert(searchInputs.length >= 1, `models tab renders search input(s), got ${searchInputs.length}`)
 assert(outM.some((n) => n.tag === 'button' && /^selectAll$/i.test((n.text || '').trim())), 'current list renders select-all')
+const renderModels = () => {
+  const nodes = []
+  renderAt(tree, fake, 'root', nodes)
+  return nodes
+}
+const settle = () => new Promise((r) => setTimeout(r, 10))
+const formControl = (nodes, tag, label) => nodes.find((n) => n.tag === tag && n.props?.['aria-label'] === label)
+const buttonByText = (nodes, text) => nodes.find((n) => n.tag === 'button' && n.text === text)
+const lastApply = () => remoteCalls.filter((c) => c.method === 'applyModels').at(-1)
+let modelNodes = renderModels()
+assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputTextOnly'), 'known text models have a text-only badge')
+assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputTextImage'), 'known image models have an image-capability badge')
+assert(modelNodes.some((n) => n.tag === 'span' && n.text === 'inputUnknown'), 'missing capability is unconfirmed, not text-only')
+assert(formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name')?.props.value === 'auto', 'vision-like names without metadata stay automatic/unconfirmed')
+
+// Manual capability is carried in the saved model, and automatic reset has an
+// explicit null rather than disappearing during JSON serialization.
+formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name').onChange({ target: { value: 'image' } })
+formControl(modelNodes, 'select', 'inputCapabilityCol: known-image-model').onChange({ target: { value: 'text' } })
+modelNodes = renderModels()
+assert(buttonByText(modelNodes, 'identifyCapabilities').props.disabled && buttonByText(modelNodes, 'identifyCapabilities').props.title === 'saveModelConfigFirst', 'capability backfill waits for unsaved manual choices')
+buttonByText(modelNodes, 'saveModelConfig').onClick()
+await settle()
+assert(JSON.stringify(lastApply().payload.models.find((m) => m.id === 'custom-vision-name').input) === JSON.stringify(['text', 'image']), 'manual image support is sent to apply-models')
+assert(JSON.stringify(lastApply().payload.models.find((m) => m.id === 'known-image-model').input) === JSON.stringify(['text']), 'manual text-only support is sent to apply-models')
+assert(!Object.hasOwn(lastApply().payload.models.find((m) => m.id === 'known-image-model'), 'capabilitySource'), 'manual capability edits do not retain automatic detection source')
+modelNodes = renderModels()
+formControl(modelNodes, 'select', 'inputCapabilityCol: custom-vision-name').onChange({ target: { value: 'auto' } })
+modelNodes = renderModels()
+buttonByText(modelNodes, 'saveModelConfig').onClick()
+await settle()
+assert(lastApply().payload.models.find((m) => m.id === 'custom-vision-name').input === null, 'automatic reset sends input:null')
+
+// Clearing the last wire mapping must leave a reachable save action.
+modelNodes = renderModels()
+formControl(modelNodes, 'input', 'reqModelField: deepseek-chat').onChange({ target: { value: '' } })
+modelNodes = renderModels()
+assert(buttonByText(modelNodes, 'saveModelConfig'), 'save action remains available after clearing the last mapping')
+assert(buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'capability backfill waits for an unsaved mapping change')
+buttonByText(modelNodes, 'saveModelConfig').onClick()
+await settle()
+assert(lastApply().payload.models.find((m) => m.id === 'deepseek-chat').requestModel === null, 'clearing a mapping sends requestModel:null')
+
+// Backfill uses the existing merge operation with the current full model list.
+modelNodes = renderModels()
+buttonByText(modelNodes, 'identifyCapabilities').onClick()
+await settle()
+assert(lastApply().payload.mode === 'merge' && lastApply().payload.models.length === 3, 'detect-and-save applies the current list for persistent capability backfill')
+
+// Remote badges also preserve the distinction between absent metadata and text.
+modelNodes = renderModels()
+buttonByText(modelNodes, 'discover').onClick()
+await settle()
+modelNodes = renderModels()
+const remoteUnknown = modelNodes.find((n) => n.tag === 'tr' && n.text.includes('unknown-vision'))
+assert(remoteUnknown?.text.includes('inputUnknown') && !remoteUnknown.text.includes('inputTextOnly'), 'discovery does not infer capability from a vision-like name')
+assert(modelNodes.some((n) => n.tag === 'tr' && n.text.includes('remote-image') && n.text.includes('inputTextImage')), 'discovery displays known image capability')
 // open the add-model form and assert its fields + submit button render
 const addToggle = outM.find((n) => n.tag === 'button' && /addModelToggle|addModelHide/i.test(n.text || ''))
 assert(addToggle && typeof addToggle.onClick === 'function', 'custom-model add toggle present')
@@ -348,6 +436,22 @@ await new Promise((r) => setTimeout(r, 10))
 renderAt(tree, fake, 'root', outA)
 assert(outA.some((n) => String(n.className).includes('mpro-addBar')), 'add-model form panel renders')
 assert(outA.some((n) => n.tag === 'button' && /addModelBtn/i.test(n.text || '')), 'add-model submit button renders')
+modelNodes = renderModels()
+const newCapability = formControl(modelNodes, 'select', 'addModelInputLabel')
+assert(newCapability?.props.value === 'auto', 'custom model capability defaults to automatic detection')
+const newId = modelNodes.find((n) => n.tag === 'input' && n.props?.placeholder === 'addModelIdPlaceholder')
+newId.onChange({ target: { value: 'my-custom-model' } })
+newCapability.onChange({ target: { value: 'image' } })
+modelNodes = renderModels()
+buttonByText(modelNodes, 'addModelBtn').onClick()
+await settle()
+assert(lastApply().payload.models[0].id === 'my-custom-model' && JSON.stringify(lastApply().payload.models[0].input) === JSON.stringify(['text', 'image']), 'custom model add saves manual image capability')
+modelNodes = renderModels()
+modelNodes.find((n) => n.tag === 'input' && n.props?.placeholder === 'addModelIdPlaceholder').onChange({ target: { value: 'automatic-custom-model' } })
+modelNodes = renderModels()
+buttonByText(modelNodes, 'addModelBtn').onClick()
+await settle()
+assert(!Object.hasOwn(lastApply().payload.models[0], 'input'), 'custom model add with automatic detection omits input rather than resetting it')
 
 // -- conversation badge (turnTail): select + render pipeline --
 {

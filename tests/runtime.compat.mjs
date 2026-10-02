@@ -103,8 +103,14 @@ r = await rpc('updateField', { route: 'compat-test', field: 'displayName', value
 assert.equal(r.ok, true, r.error)
 r = await rpc('updateHeaders', { route: 'compat-test', headers: [{ name: 'X-Test', value: 'compat' }] })
 assert.equal(r.ok, true, r.error)
-r = await rpc('applyModels', { route: 'compat-test', mode: 'replace', models: [{ id: 'test-model', requestModel: 'wire-model' }] })
+r = await rpc('applyModels', { route: 'compat-test', mode: 'replace', models: [{ id: 'test-model', requestModel: 'wire-model', input: ['text', 'image'], capabilitySource: 'discovery' }] })
 assert.equal(r.ok, true, r.error)
+assert.deepEqual(section('llm-pi-ai').providers['compat-test'].models[0].input, ['text', 'image'])
+assert(!('capabilitySource' in section('llm-pi-ai').providers['compat-test'].models[0]), 'Display-only capability metadata must not reach the Harness schema')
+const modelsBeforeInvalidInput = JSON.stringify(section('llm-pi-ai').providers['compat-test'].models)
+r = await rpc('applyModels', { route: 'compat-test', mode: 'merge', models: [{ id: 'test-model', input: ['audio'] }] })
+assert.equal(r.ok, false)
+assert.equal(JSON.stringify(section('llm-pi-ai').providers['compat-test'].models), modelsBeforeInvalidInput)
 r = await rpc('setApiKey', { route: 'compat-test', apiKey: 'synthetic-test-key' })
 assert.equal(r.ok, true, r.error)
 assert.equal(secrets.get('DSH_COMPAT_TEST_API_KEY'), 'synthetic-test-key')
@@ -116,6 +122,8 @@ for (const enabled of [false, true, false, true]) {
   assert.equal(r.ok, true, r.error)
   assert.equal(!!section('llm-pi-ai').providers['compat-test'], enabled)
   assert.equal(!!section('dsh-model-pro').state.disabledProviders['compat-test'], !enabled)
+  const profile = enabled ? section('llm-pi-ai').providers['compat-test'] : section('dsh-model-pro').state.disabledProviders['compat-test']
+  assert.deepEqual(profile.models[0].input, ['text', 'image'])
 }
 r = await rpc('setRoute', { alias: 'test-auto', strategy: 'priority', targets: [{ provider: 'compat-test', model: 'test-model' }] })
 assert.equal(r.ok, true, r.error)
@@ -149,6 +157,7 @@ else {
 }
 assert(section('llm-pi-ai').providers['compat-test'])
 assert.equal(section('llm-pi-ai').providers['compat-test'].headers['X-Test'], 'compat')
+assert.deepEqual(section('llm-pi-ai').providers['compat-test'].models[0].input, ['text', 'image'])
 if (actualRoot) {
   actualFiber = actualRoot.plugin(actualModule, entries[1].options.config)
   entries[1].fiber = actualFiber
@@ -171,4 +180,4 @@ assert.deepEqual(Object.keys(section('llm-pi-ai')), ['providers'])
 // 新版接口拒绝越界字段和过期 revision，本修复保留这些约束。
 await assert.rejects(st.replace('llm-pi-ai', { disabledProviders: {} }), /not volatile/)
 await assert.rejects(st.mutate('llm-pi-ai', [{ op: 'set', path: ['providers'], value: {} }], -1), /revision|conflict/i)
-console.log('PASS: real Harness 0.2.0-rc.2 registry and SettingsForms; provider CRUD, headers, models, encryption, toggle, routing, composites, rollback, revision conflict and existing-data preservation')
+console.log('PASS: real Harness 0.2.0-rc.2 registry and SettingsForms; provider CRUD, multimodal input persistence and restoration, headers, encryption, toggle, routing, composites, rollback, revision conflict and existing-data preservation')

@@ -124,11 +124,18 @@ export interface ProviderProfile {
 /** A model entry in a provider's models array. `requestModel`, when set, is the
  * real model id forwarded to the provider (the wire id differs from the
  * selectable `id` — see the llm/stream rewrite in the host half). */
+export type ModelInput = 'text' | 'image'
+export type ModelCapabilitySource = 'configured' | 'discovery' | 'catalog'
+
 export interface ModelEntry {
   id: string
   name?: string
   contextWindow?: number
   maxTokens?: number
+  /** Harness 当前支持的输入类型；缺失表示尚未确认，而非仅文本。 */
+  input?: ModelInput[]
+  /** 仅用于展示识别来源，不写入供应商配置。 */
+  capabilitySource?: ModelCapabilitySource
   /** Optional wire model id different from `id`. */
   requestModel?: string
   [key: string]: unknown
@@ -189,11 +196,8 @@ export interface HeaderPair {
 }
 
 /** A discovered model from the llm.discoverModels API */
-export interface DiscoveredModel {
-  id: string
+export interface DiscoveredModel extends ModelEntry {
   name: string
-  contextWindow?: number
-  maxTokens?: number
 }
 
 /** RPC response wrapper */

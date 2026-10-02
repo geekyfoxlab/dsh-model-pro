@@ -43,9 +43,19 @@ interface AddDraft {
   ctx: string
   out: string
   wire: string
+  capability: CapabilityChoice
 }
 
-const EMPTY_DRAFT: AddDraft = { id: '', name: '', ctx: '', out: '', wire: '' }
+type CapabilityChoice = 'auto' | 'text' | 'image'
+
+const EMPTY_DRAFT: AddDraft = { id: '', name: '', ctx: '', out: '', wire: '', capability: 'auto' }
+
+/** 未提供能力与已确认仅支持文本是不同状态，不能根据模型名猜测。 */
+const capabilityChoice = (model: ModelEntry): CapabilityChoice =>
+  model.input?.includes('image') ? 'image' : model.input?.includes('text') ? 'text' : 'auto'
+
+const capabilityInput = (choice: Exclude<CapabilityChoice, 'auto'>): Array<'text' | 'image'> =>
+  choice === 'image' ? ['text', 'image'] : ['text']
 
 export function ModelsPanel({
   t, call, route, info, set, protocols, models, setModels,
@@ -61,8 +71,13 @@ export function ModelsPanel({
   // Manual custom-model form.
   const [showAdd, setShowAdd] = React.useState(false)
   const [draft, setDraft] = React.useState<AddDraft>(EMPTY_DRAFT)
+  const [capabilityDraft, setCapabilityDraft] = React.useState<Record<string, CapabilityChoice>>({})
+  const [mappingDirty, setMappingDirty] = React.useState(false)
 
   const curList = models || []
+  const hasUnsavedConfig = mappingDirty || Object.keys(capabilityDraft).length > 0
+  const draftCapability = (id: string): CapabilityChoice | undefined =>
+    Object.prototype.hasOwnProperty.call(capabilityDraft, id) ? capabilityDraft[id] : undefined
 
   // --- discovered list: search-aware bulk selection -------------------------
   const discVisible = (discovered || []).filter((m) => matchQ(m, discQ))
@@ -135,6 +150,8 @@ export function ModelsPanel({
     const fresh = await call('get-provider', { route })
     const list: ModelEntry[] = fresh.models || []
     setModels(list)
+    setCapabilityDraft({})
+    setMappingDirty(false)
     pruneCurSel(list)
     return list
   }
@@ -164,14 +181,33 @@ export function ModelsPanel({
   const setRequestModel = async (id: string, wire: string) => {
     const next = curList.map((m) => (m.id === id ? { ...m, ...(wire.trim() ? { requestModel: wire.trim() } : { requestModel: undefined }) } : m))
     setModels(next)
+    setMappingDirty(true)
   }
 
-  const saveMappings = async () => {
-    const list = curList.filter((m) => m.requestModel)
+  const saveModelConfig = async () => {
+    // 完整发送当前列表，才能保留“清空转发名”的修改；仅自动重置使用 null。
+    const list = curList.map((m) => {
+      const choice = draftCapability(m.id)
+      const entry = { ...m, requestModel: m.requestModel?.trim() || null }
+      if (!choice) return entry
+      // 来源仅描述读取结果；手动选择不应继续沿用“自动发现”的来源。
+      const { capabilitySource: _source, ...configured } = entry
+      return { ...configured, input: choice === 'auto' ? null : capabilityInput(choice) }
+    })
     if (!list.length) return
     setBusy(true); setStatus(null)
     try {
       const r = await call('apply-models', { route, models: list, mode: 'merge' })
+      setStatus({ kind: 'ok', text: fmt(t('statusModels'), { count: r.count }) })
+      await refreshModels()
+    } catch (e) { fail(e) } finally { setBusy(false) }
+  }
+
+  const identifyCapabilities = async () => {
+    if (!curList.length || hasUnsavedConfig) return
+    setBusy(true); setStatus(null)
+    try {
+      const r = await call('apply-models', { route, models: curList, mode: 'merge' })
       setStatus({ kind: 'ok', text: fmt(t('statusModels'), { count: r.count }) })
       await refreshModels()
     } catch (e) { fail(e) } finally { setBusy(false) }
@@ -193,6 +229,7 @@ export function ModelsPanel({
       ...(numOrNull(draft.ctx) != null ? { contextWindow: numOrNull(draft.ctx) } : {}),
       ...(numOrNull(draft.out) != null ? { maxTokens: numOrNull(draft.out) } : {}),
       ...(draft.wire.trim() ? { requestModel: draft.wire.trim() } : {}),
+      ...(draft.capability !== 'auto' ? { input: capabilityInput(draft.capability) } : {}),
     }
     setBusy(true); setStatus(null)
     try {
@@ -212,9 +249,30 @@ export function ModelsPanel({
     />
   )
 
+  const capabilityBadge = (model: ModelEntry) => {
+    const choice = capabilityChoice(model)
+    return <span className={choice === 'auto' ? 'mpro-chip mpro-capabilityUnknown' : 'mpro-chip'}>{t(choice === 'image' ? 'inputTextImage' : choice === 'text' ? 'inputTextOnly' : 'inputUnknown')}</span>
+  }
+
+  const capabilitySelect = (value: CapabilityChoice, onChange: (value: CapabilityChoice) => void, label: string) => (
+    <select
+      className="mpro-input mpro-select mpro-capabilitySelect"
+      aria-label={label}
+      title={t('inputCapabilityHint')}
+      value={value}
+      disabled={busy}
+      onChange={(e) => onChange(e.target.value as CapabilityChoice)}
+    >
+      <option value="auto">{t('inputAuto')}</option>
+      <option value="text">{t('inputTextOnly')}</option>
+      <option value="image">{t('inputTextImage')}</option>
+    </select>
+  )
+
   return (
     <div className="mpro-panel">
       <p className="mpro-hint">{t('modelsHint')}</p>
+      <p className="mpro-hint">{t('inputCapabilityHint')}</p>
 
       {/* discovery bar */}
       <div className="mpro-discoverBar">
@@ -316,6 +374,10 @@ export function ModelsPanel({
               onChange={(e) => setDraftField({ wire: e.target.value })}
             />
           </div>
+          <div className="mpro-field" style={{ flex: 1, minWidth: 150 }}>
+            <span className="mpro-fieldLabel">{t('inputCapabilityCol')}</span>
+            {capabilitySelect(draft.capability, (capability) => setDraftField({ capability }), t('addModelInputLabel'))}
+          </div>
           <button
             className="mpro-btn mpro-btnPrimary"
             disabled={busy || !draft.id.trim()}
@@ -352,6 +414,7 @@ export function ModelsPanel({
                       <th className="mpro-tblCk"></th>
                       <th>{t('idCol')}</th>
                       <th>{t('nameCol')}</th>
+                      <th>{t('inputCapabilityCol')}</th>
                       <th>{t('ctxCol')}</th>
                       <th>{t('outCol')}</th>
                     </tr>
@@ -364,6 +427,7 @@ export function ModelsPanel({
                         </td>
                         <td className="mpro-id">{m.id}</td>
                         <td>{m.name || m.id}</td>
+                        <td>{capabilityBadge(m)}</td>
                         <td className="mpro-dim">{m.contextWindow ? String(m.contextWindow) : '—'}</td>
                         <td className="mpro-dim">{m.maxTokens ? String(m.maxTokens) : '—'}</td>
                       </tr>
@@ -395,11 +459,12 @@ export function ModelsPanel({
               <button className="mpro-btn mpro-btnSm" onClick={selectAllCur}>{t('selectAll')}</button>
               <button className="mpro-btn mpro-btnSm" onClick={unselectAllCur}>{t('unselectAll')}</button>
               <button className="mpro-btn mpro-btnSm" onClick={invertCur}>{t('invert')}</button>
+              <button className="mpro-btn mpro-btnSm" disabled={busy || hasUnsavedConfig} title={hasUnsavedConfig ? t('saveModelConfigFirst') : undefined} onClick={() => void identifyCapabilities()}>{t('identifyCapabilities')}</button>
             </>
           )}
-          {(curList || []).some((m) => m.requestModel) && (
-            <button className="mpro-btn mpro-btnSm" disabled={busy} onClick={() => void saveMappings()}>
-              {t('saveMappings')}
+          {curList.length > 0 && (
+            <button className="mpro-btn mpro-btnSm" disabled={busy} onClick={() => void saveModelConfig()}>
+              {t('saveModelConfig')}
             </button>
           )}
           {curSelectedCount > 0 && (
@@ -420,6 +485,7 @@ export function ModelsPanel({
                   <th className="mpro-tblCk"></th>
                   <th>{t('idCol')}</th>
                   <th>{t('nameCol')}</th>
+                  <th>{t('inputCapabilityCol')}</th>
                   <th>{t('reqModelField')}</th>
                 </tr>
               </thead>
@@ -432,7 +498,14 @@ export function ModelsPanel({
                     <td className="mpro-id">{m.id}</td>
                     <td>{m.name || m.id}</td>
                     <td>
+                      <div className="mpro-capabilityCell">
+                        {capabilityBadge(m)}
+                        {capabilitySelect(draftCapability(m.id) ?? capabilityChoice(m), (choice) => setCapabilityDraft((d) => ({ ...d, [m.id]: choice })), `${t('inputCapabilityCol')}: ${m.id}`)}
+                      </div>
+                    </td>
+                    <td>
                       <input
+                        aria-label={`${t('reqModelField')}: ${m.id}`}
                         title={t('reqModelHint')}
                         className="mpro-input mpro-inputMono"
                         style={{ width: 150 }}

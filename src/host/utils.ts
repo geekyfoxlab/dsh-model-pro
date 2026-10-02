@@ -10,7 +10,7 @@
 
 import { NS, ROUTES_KEY } from '../shared/constants'
 import { PACKAGE } from '../shared/contract'
-import type { ProviderProfile, RoutesMap } from '../shared/types'
+import type { ProviderProfile, RoutesMap, DiscoveredModel, ModelInput } from '../shared/types'
 
 /** Settings service interface (subset we use) */
 export interface SettingsService {
@@ -25,6 +25,7 @@ interface SettingsDescriptor {
   ns: string
   revision: number
   value: Record<string, unknown>
+  user?: Record<string, unknown>
 }
 interface SettingsOp {
   op: 'set'
@@ -72,7 +73,7 @@ export async function restoreModernProviders(st: SettingsService, providers: Rec
 }
 
 /** LLM service interface (subset we use) */
-interface LLMService {
+export interface LLMService {
   listConfigurableProviders(): Array<{
     settingsNs: string
     provider: string
@@ -80,7 +81,7 @@ interface LLMService {
     declared?: boolean
   }>
   discoverModels(ns: string, request: Record<string, unknown>): Promise<
-    Array<{ id: string; name?: string; contextWindow?: number; maxTokens?: number }>
+    Array<Partial<DiscoveredModel> & { id: string; inputModalities?: ModelInput[] }>
   >
 }
 
