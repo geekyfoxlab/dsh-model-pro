@@ -8,6 +8,8 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import { pathToFileURL } from 'node:url'
 
+const plain = (value) => JSON.parse(JSON.stringify(value))
+
 const root = process.env.DSH_RUNTIME_ROOT
 if (!root) throw new Error('DSH_RUNTIME_ROOT must point at the bundled dsh directory')
 const load = (name) => import(pathToFileURL(`${root}/node_modules/@deepseek-ai/${name}/lib/index.js`).href)
@@ -41,6 +43,9 @@ const markedProvider = { api: 'openai-completions', baseURL: 'https://marked.inv
 const initial = { providers: {
   existing: { api: 'openai-completions', baseURL: 'https://existing.invalid/v1', apiKeyEnv: 'EXISTING_KEY', models: [{ id: 'original' }], headers: { 'X-Preserve': 'yes' } },
   'marked-at-start': markedProvider,
+  'identify-test': { api: 'openai-completions', baseURL: 'https://identify.invalid/v1', defaultInput: ['text'], headers: { 'X-Identify': 'preserve' }, models: [
+    { id: 'gpt-4o' }, { id: 'catalog-text' }, { id: 'manual-text', input: ['text'] }, { id: 'unknown-model' }, { id: 'alias-fixture', requestModel: 'gpt-4o' },
+  ] },
 } }
 const priorStats = { calls: 4, errors: 0, latencySum: 20, latencyN: 4, tokensIn: 8, tokensOut: 12 }
 const pluginConfig = { state: { routeStats: {
@@ -70,16 +75,28 @@ assert.equal(typeof st.get, 'undefined')
 const before = JSON.stringify(st.describe().find((x) => x.ns === 'llm-pi-ai').value.providers.existing)
 const secrets = new Map([['EXISTING_KEY', 'existing-test-secret']])
 const cleanups = []
+let catalogMode = 'ready'
+let catalogReads = 0
+const llm = {
+  listConfigurableProviders: () => catalogMode === 'empty' ? [] : [{ settingsNs: 'llm-pi-ai', provider: 'openai', declared: false }],
+  async discoverModels() {
+    catalogReads++
+    if (catalogMode === 'failed') throw new Error('synthetic catalog failure')
+    return [{ id: 'gpt-4o', inputModalities: ['text', 'image'] }, { id: 'catalog-text', inputModalities: ['text'] }, { id: 'manual-text', inputModalities: ['text', 'image'] }]
+  },
+  registerAdapter: () => () => {}, listModels: async () => [],
+}
 const ctx = { get(name) {
   if (name === 'settings') return st
-  if (name === 'llm') return { listConfigurableProviders: () => [], registerAdapter: () => () => {}, listModels: async () => [] }
+  if (name === 'llm') return llm
+  if (name === 'configEditor') return st.ownerContext.configEditor
   if (name === 'credentials') return { resolve: async (ref) => ({ value: secrets.get(ref) }), set: async (ref, value) => secrets.set(ref, value), unset: async (ref) => secrets.delete(ref) }
 }, typert: { register() { return () => {} } }, effect(fn) { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup); return cleanup }, on() { return () => {} } }
 if (process.env.MODEL_PRO_ACTUAL_PLUGIN) {
   actualModule = await import(pathToFileURL(process.env.MODEL_PRO_ACTUAL_PLUGIN).href)
   actualRoot = new Context()
   new TypertRegistry(actualRoot)
-  for (const name of ['settings', 'llm', 'credentials']) actualRoot.provide(name, ctx.get(name))
+  for (const name of ['settings', 'llm', 'credentials', 'configEditor']) actualRoot.provide(name, ctx.get(name))
   // 使用实际 fiber.state；apply 期间 state=1 的自身表单不可读，不能以伪 state=2 掩盖就绪时序。
   actualFiber = actualRoot.plugin(actualModule, entries[1].options.config)
   entries[1].fiber = actualFiber
@@ -93,8 +110,48 @@ assert(!section('llm-pi-ai').providers['marked-at-start'], 'Marked provider was 
 assert(section('dsh-model-pro').state.disabledProviders['marked-at-start'])
 assert.equal((await rpc('getRouteStats')).byTarget['existing\u0000original'].calls, 4, 'Own-form readiness must rehydrate persisted stats')
 assert((await rpc('listRequestLogs')).entries.some((entry) => entry.route === 'prior-auto'), 'Own-form readiness must rehydrate persisted logs')
+// 真实 schema 把未声明的 input 物化为空数组，识别按钮仍须按目录补齐；旧文本默认不阻断。
+assert.deepEqual(section('llm-pi-ai').providers['identify-test'].models[0].input, [])
+const identifyBefore = section('llm-pi-ai').providers['identify-test']
+const identifyOtherFields = JSON.stringify(Object.fromEntries(Object.entries(identifyBefore).filter(([key]) => key !== 'models')))
+const identifyArgs = { route: 'identify-test', mode: 'identify', models: identifyBefore.models.map(({ id }) => ({ id })) }
+let identified = await rpc('applyModels', identifyArgs)
+assert.equal(identified.ok, true, identified.error)
+assert.equal(identified.capabilitySummary.updated, 3)
+assert.equal(identified.capabilitySummary.preserved, 1)
+assert.equal(identified.capabilitySummary.unknown, 1)
+assert.equal(identified.capabilitySummary.image, 2)
+assert.equal(identified.capabilitySummary.text, 2)
+assert.equal(identified.capabilitySummary.catalogUnavailable, false)
+assert.equal(catalogReads, 1, 'One identify operation shares a refreshed catalog across all models')
+let identifiedProfile = section('llm-pi-ai').providers['identify-test']
+assert.deepEqual(plain(identifiedProfile.models.find(({ id }) => id === 'gpt-4o').input), ['text', 'image'])
+assert.deepEqual(plain(identifiedProfile.models.find(({ id }) => id === 'alias-fixture').input), ['text', 'image'])
+assert.equal(identifiedProfile.models.find(({ id }) => id === 'alias-fixture').requestModel, 'gpt-4o')
+assert.deepEqual(plain(identifiedProfile.models.find(({ id }) => id === 'manual-text').input), ['text'])
+assert.deepEqual(plain(identifiedProfile.models.find(({ id }) => id === 'unknown-model').input), [])
+assert.equal(JSON.stringify(Object.fromEntries(Object.entries(identifiedProfile).filter(([key]) => key !== 'models'))), identifyOtherFields)
+const afterIdentifyRevision = st.describe().find(({ ns }) => ns === 'llm-pi-ai').revision
+const afterIdentifyRaw = JSON.stringify(entries.map((entry) => entry.options.config))
+identified = await rpc('applyModels', identifyArgs)
+assert.equal(identified.ok, true, identified.error)
+assert.equal(identified.capabilitySummary.updated, 0)
+assert.equal(identified.capabilitySummary.preserved, 4)
+assert.equal(identified.capabilitySummary.unknown, 1)
+assert.equal(st.describe().find(({ ns }) => ns === 'llm-pi-ai').revision, afterIdentifyRevision)
+assert.equal(JSON.stringify(entries.map((entry) => entry.options.config)), afterIdentifyRaw, 'Idempotent identify does not write resolved schema defaults')
+for (const mode of ['empty', 'failed']) {
+  catalogMode = mode
+  identified = await rpc('applyModels', { route: 'identify-test', mode: 'identify', models: [{ id: 'unknown-model' }] })
+  assert.equal(identified.ok, true, identified.error)
+  assert.equal(identified.capabilitySummary.updated, 0)
+  assert.equal(identified.capabilitySummary.unknown, 1)
+  assert.equal(identified.capabilitySummary.catalogUnavailable, true)
+  assert.equal(JSON.stringify(entries.map((entry) => entry.options.config)), afterIdentifyRaw)
+}
+catalogMode = 'ready'
 let r = await rpc('listProviders')
-assert.equal(r.providers.length, 2)
+assert.equal(r.providers.length, 3)
 assert(r.providers.some((provider) => provider.route === 'existing' && !provider.disabled))
 assert(r.providers.some((provider) => provider.route === 'marked-at-start' && provider.disabled))
 r = await rpc('createProvider', { route: 'compat-test', api: 'openai-completions', baseURL: 'https://test.invalid/v1', displayName: 'Compatibility test' })
@@ -105,7 +162,7 @@ r = await rpc('updateHeaders', { route: 'compat-test', headers: [{ name: 'X-Test
 assert.equal(r.ok, true, r.error)
 r = await rpc('applyModels', { route: 'compat-test', mode: 'replace', models: [{ id: 'test-model', requestModel: 'wire-model', input: ['text', 'image'], capabilitySource: 'discovery' }] })
 assert.equal(r.ok, true, r.error)
-assert.deepEqual(section('llm-pi-ai').providers['compat-test'].models[0].input, ['text', 'image'])
+assert.deepEqual(plain(section('llm-pi-ai').providers['compat-test'].models[0].input), ['text', 'image'])
 assert(!('capabilitySource' in section('llm-pi-ai').providers['compat-test'].models[0]), 'Display-only capability metadata must not reach the Harness schema')
 const modelsBeforeInvalidInput = JSON.stringify(section('llm-pi-ai').providers['compat-test'].models)
 r = await rpc('applyModels', { route: 'compat-test', mode: 'merge', models: [{ id: 'test-model', input: ['audio'] }] })
@@ -123,7 +180,7 @@ for (const enabled of [false, true, false, true]) {
   assert.equal(!!section('llm-pi-ai').providers['compat-test'], enabled)
   assert.equal(!!section('dsh-model-pro').state.disabledProviders['compat-test'], !enabled)
   const profile = enabled ? section('llm-pi-ai').providers['compat-test'] : section('dsh-model-pro').state.disabledProviders['compat-test']
-  assert.deepEqual(profile.models[0].input, ['text', 'image'])
+  assert.deepEqual(plain(profile.models[0].input), ['text', 'image'])
 }
 r = await rpc('setRoute', { alias: 'test-auto', strategy: 'priority', targets: [{ provider: 'compat-test', model: 'test-model' }] })
 assert.equal(r.ok, true, r.error)
@@ -157,7 +214,7 @@ else {
 }
 assert(section('llm-pi-ai').providers['compat-test'])
 assert.equal(section('llm-pi-ai').providers['compat-test'].headers['X-Test'], 'compat')
-assert.deepEqual(section('llm-pi-ai').providers['compat-test'].models[0].input, ['text', 'image'])
+assert.deepEqual(plain(section('llm-pi-ai').providers['compat-test'].models[0].input), ['text', 'image'])
 if (actualRoot) {
   actualFiber = actualRoot.plugin(actualModule, entries[1].options.config)
   entries[1].fiber = actualFiber
@@ -180,4 +237,4 @@ assert.deepEqual(Object.keys(section('llm-pi-ai')), ['providers'])
 // 新版接口拒绝越界字段和过期 revision，本修复保留这些约束。
 await assert.rejects(st.replace('llm-pi-ai', { disabledProviders: {} }), /not volatile/)
 await assert.rejects(st.mutate('llm-pi-ai', [{ op: 'set', path: ['providers'], value: {} }], -1), /revision|conflict/i)
-console.log('PASS: real Harness 0.2.0-rc.2 registry and SettingsForms; provider CRUD, multimodal input persistence and restoration, headers, encryption, toggle, routing, composites, rollback, revision conflict and existing-data preservation')
+console.log('PASS: real Harness 0.2.0-rc.2 registry and SettingsForms; capability identification from schema-default empty input, idempotence and unavailable catalogs, provider CRUD, multimodal input persistence and restoration, headers, encryption, toggle, routing, composites, rollback, revision conflict and existing-data preservation')

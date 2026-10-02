@@ -87,7 +87,8 @@ async function catalogInputs(llm: LLMService): Promise<CatalogInputs> {
 export async function resolveModelInput(ctx: HostCtx, route: string, entry: ModelEntry): Promise<ModelInput[] | undefined> {
   const configured = normalizeModelInput(entry.input)
   if (configured) return configured
-  if (entry.input !== undefined) return undefined
+  // Harness 的 schema 会为缺失数组生成 []；与原生 declaredInput 一样视为未声明。
+  if (entry.input !== undefined && !(Array.isArray(entry.input) && entry.input.length === 0)) return undefined
   const llm = ctx.get('llm')
   if (!llm) return declaredDefaultInput(ctx, route)
   const catalog = await catalogInputs(llm)
@@ -97,6 +98,29 @@ export async function resolveModelInput(ctx: HostCtx, route: string, entry: Mode
   const providerDefault = declaredDefaultInput(ctx, route)
   if (providerDefault) return providerDefault
   return catalog.byId.get(id) ?? undefined
+}
+
+/** 按钮显式请求一次目录识别，使用同一份快照处理全部模型，不发推理请求。 */
+export async function detectModelInputs(ctx: HostCtx, route: string, entries: ModelEntry[]): Promise<{
+  inputs: Map<string, ModelInput[]>
+  catalogUnavailable: boolean
+}> {
+  const inputs = new Map<string, ModelInput[]>()
+  if (!entries.length) return { inputs, catalogUnavailable: false }
+  const llm = ctx.get('llm')
+  if (llm) catalogs.delete(llm)
+  const catalog = llm ? await catalogInputs(llm) : undefined
+  const providerDefault = declaredDefaultInput(ctx, route)
+  for (const entry of entries) {
+    const id = typeof entry.requestModel === 'string' && entry.requestModel.trim() ? entry.requestModel.trim() : entry.id
+    const own = catalog?.byRoute.get(route)
+    const input = own?.has(id) ? own.get(id) : catalog?.byId.get(id)
+    // defaultInput:text 可能是此前保存时带入的 schema 默认，不能阻止按型号补齐。
+    // 已明确声明图片默认时，未知目录型号仍可沿用该声明。
+    const resolved = input ?? (providerDefault?.includes('image') ? providerDefault : undefined)
+    if (resolved && !(own?.has(id) && own.get(id) === null)) inputs.set(entry.id, [...resolved])
+  }
+  return { inputs, catalogUnavailable: !catalog || !catalog.complete || catalog.byRoute.size === 0 }
 }
 
 /** 读操作附加展示来源；apply-models 只持久化 input，不持久化来源标签。 */

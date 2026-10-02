@@ -1200,7 +1200,7 @@ await P('delete-provider', { route: 'comp-b' })
   await call('apply-models', { route: 'gateway', models: [{ id: 'alias', input: ['text'], requestModel: null }], mode: 'merge' })
   assert(!capStore.doc().providers.gateway.models.find((entry) => entry.id === 'alias').requestModel, 'clearing wire mapping persists')
   const beforeInvalid = JSON.stringify(capStore.doc())
-  for (const input of [[], ['audio'], ['text', 'video'], 'image']) {
+  for (const input of [['audio'], ['text', 'video'], 'image']) {
     result = await call('apply-models', { route: 'gateway', models: [{ id: 'known-image', input }], mode: 'merge' })
     assert(!result.ok && JSON.stringify(capStore.doc()) === beforeInvalid, 'invalid/unsupported input fails without writing')
   }
@@ -1208,6 +1208,23 @@ await P('delete-provider', { route: 'comp-b' })
   await call('apply-models', { route: 'gateway', models: [{ id: 'known-image', input: ['text'] }], mode: 'merge' })
   assert(capStore.doc().disabledProviders.gateway.models.find((entry) => entry.id === 'known-image').input.join() === 'text', 'disabled provider capability remains editable')
   assert(catalogCalls.length === 2, 'catalog identity index is reused without repeated discovery')
+
+  const identifyStore = createSettings({ providers: { gateway: { defaultInput: ['text'], models: [
+    { id: 'known-image', input: [] }, { id: 'manual', input: ['text'] }, { id: 'unknown-vision-name', input: [] },
+  ] } } })
+  const identifyHost = await loadHost()
+  identifyHost.apply({ ...capCtx, get: (name) => name === 'settings' ? identifyStore : name === 'llm' ? capLlm : undefined })
+  const identifyRpc = identifyHost.runtimes.at(-1)
+  const identifyArgs = { route: 'gateway', mode: 'identify', models: identifyStore.doc().providers.gateway.models.map(({ id }) => ({ id })) }
+  result = await identifyRpc.applyModels(identifyArgs)
+  assertStrict.deepEqual(JSON.parse(JSON.stringify(result.capabilitySummary)), { image: 1, text: 1, unknown: 1, preserved: 1, updated: 1, catalogUnavailable: false })
+  assert(identifyStore.doc().providers.gateway.models[0].input.includes('image'), 'dedicated identify treats schema [] as undeclared and bypasses a generic text default')
+  const afterIdentify = JSON.stringify(identifyStore.doc())
+  result = await identifyRpc.applyModels(identifyArgs)
+  assert(result.capabilitySummary.updated === 0 && result.capabilitySummary.preserved === 2 && result.capabilitySummary.unknown === 1, 'repeated identify reports preserved and unknown instead of an apparent success count')
+  assert(JSON.stringify(identifyStore.doc()) === afterIdentify, 'no capability updates leave the settings unchanged')
+  result = await identifyRpc.applyModels({ route: 'gateway', mode: 'identify', models: [{ id: 'removed-model' }] })
+  assert(!result.ok && JSON.stringify(identifyStore.doc()) === afterIdentify, 'stale identify IDs fail visibly without overwriting provider data')
 
   let ready = false
   let failCatalog = true

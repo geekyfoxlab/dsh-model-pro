@@ -107,7 +107,6 @@ export function ModelProPage({ t, call }: Props) {
         data={selected}
         initialTab={initTab}
         onBack={() => { setSelected(null); void refresh() }}
-        fail={fail}
       />
     )
   }

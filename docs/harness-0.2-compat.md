@@ -27,6 +27,8 @@ tests/runtime.compat.mjs 使用 Harness 自带的 TypertRegistry、SettingsForms
 
 tests/runtime.multimodal.mjs 额外验证真实 PiAiAdapter 的图片能力及附件转换、LlmRuntime 的智能路由/组合能力、图片目标筛选。底层推理流使用内存替身，不向外部供应商发送请求。配置测试也覆盖 input 的保存、禁用/启用及卸载恢复。
 
+识别按钮回归使用真实 schema 生成的 `input: []`，验证目录识别及保存、已有设置保留、识别数量、目录失败与恢复、重复识别零写入，以及识别期间的并发模型编辑保护。客户端回归还验证失败提示在当前编辑页可见。
+
 ```sh
 DSH_RUNTIME_ROOT=/path/to/dsh npm run test:runtime
 ```

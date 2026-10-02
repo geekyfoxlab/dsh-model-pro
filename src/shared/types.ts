@@ -127,6 +127,15 @@ export interface ProviderProfile {
 export type ModelInput = 'text' | 'image'
 export type ModelCapabilitySource = 'configured' | 'discovery' | 'catalog'
 
+export interface ModelCapabilitySummary {
+  image: number
+  text: number
+  unknown: number
+  preserved: number
+  updated: number
+  catalogUnavailable: boolean
+}
+
 export interface ModelEntry {
   id: string
   name?: string

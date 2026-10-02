@@ -147,12 +147,22 @@ const discoveredState = [
   { id: 'unknown-vision', name: 'Unknown vision' },
 ]
 const remoteCalls = []
+let identifySummary = { image: 1, text: 1, unknown: 1, preserved: 1, updated: 1, catalogUnavailable: false }
+let identifyError = ''
+let providerRefreshError = ''
 const businessFor = (method, payload) => {
   if (method === 'listProviders') return { ok: true, providers: testProviders, protocols: ['openai-completions', 'openai-responses', 'anthropic-messages'], writable: true }
   if (method === 'listRoutes') return { ok: true, routes: { auto: { strategy: 'priority', targets: [{ provider: 'deepseek', model: 'deepseek-chat' }] } } }
-  if (method === 'getProvider') return { ok: true, models: modelState.map((m) => ({ ...m })), availableModels: [] }
+  if (method === 'getProvider') return providerRefreshError
+    ? { ok: false, error: providerRefreshError }
+    : { ok: true, route: payload?.route || 'deepseek', models: modelState.map((m) => ({ ...m })), availableModels: [] }
   if (method === 'discoverModels') return { ok: true, models: discoveredState }
   if (method === 'applyModels') {
+    // Identify has its own authoritative result; this client mock does not
+    // repeat the host's catalog matching or preservation algorithm.
+    if (payload.mode === 'identify') return identifyError
+      ? { ok: false, error: identifyError }
+      : { ok: true, count: modelState.length, ...(identifySummary ? { capabilitySummary: { ...identifySummary } } : {}) }
     const incoming = (payload.models || []).map((m) => {
       const entry = { ...m }
       if (entry.input === null) delete entry.input
@@ -200,14 +210,16 @@ for (const m of remoteMethods) {
 const structures = []
 const fake = new FakeReact()
 const slotsByName = new Map()
+let registeredLocale = null
+const translatedKeys = new Set(['statusCapabilities', 'statusCapabilitiesCurrent', 'capabilitiesUnconfirmed', 'capabilityCatalogUnavailable', 'inputCapabilityHint'])
 
 const ctx = {
   get: (name) => {
     if (name === 'locale') return {
-      register: () => {},
-      // Dictionary lookup for one badge key proves the bound t reaches the
-      // badge; everything else stays identity (existing assertions match keys).
-      bind: () => (k) => (k === 'badgeRoutePrefix' ? '路由' : k),
+      register: (_ns, dictionaries) => { registeredLocale = dictionaries },
+      // Use the real registered English copy for count/status assertions;
+      // other keys stay stable for existing structural and event selectors.
+      bind: () => (k) => (k === 'badgeRoutePrefix' ? '路由' : translatedKeys.has(k) ? registeredLocale?.en?.[k] || k : k),
     }
     if (name === 'slots') return {
       inject: (slotName, fn) => fn(),
@@ -412,11 +424,63 @@ buttonByText(modelNodes, 'saveModelConfig').onClick()
 await settle()
 assert(lastApply().payload.models.find((m) => m.id === 'deepseek-chat').requestModel === null, 'clearing a mapping sends requestModel:null')
 
-// Backfill uses the existing merge operation with the current full model list.
+// Identification sends only IDs so displayed/inferred capabilities cannot be
+// mistaken for manual choices. Counts come from the authoritative host result.
+modelState = modelState.map((m) => m.id === 'known-image-model' ? { ...m, input: ['text', 'image'] } : m)
 modelNodes = renderModels()
 buttonByText(modelNodes, 'identifyCapabilities').onClick()
+assert(buttonByText(renderModels(), 'identifyCapabilities').props.disabled, 'identify button is disabled while the request is in flight')
 await settle()
-assert(lastApply().payload.mode === 'merge' && lastApply().payload.models.length === 3, 'detect-and-save applies the current list for persistent capability backfill')
+assert(lastApply().payload.mode === 'identify' && lastApply().payload.models.length === 3, 'detect-and-save invokes the dedicated identify mode')
+assert(lastApply().payload.route === 'deepseek' && lastApply().payload.models.every((m) => Object.keys(m).length === 1 && typeof m.id === 'string'), 'identify payload contains only the current model IDs')
+modelNodes = renderModels()
+const inlineStatus = (nodes) => nodes.find((n) => n.className.includes('mpro-inlineStatus'))
+assert(inlineStatus(modelNodes)?.text.includes('1 text + image, 1 text only, 1 unconfirmed') && inlineStatus(modelNodes).text.includes('Kept 1 existing settings; updated 1 models'), 'identify reports image, text, unknown, preserved and updated counts')
+assert(inlineStatus(modelNodes).text.includes('Set unconfirmed input capabilities manually'), 'unknown models receive a manual-setting explanation')
+assert(!buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'identify button restores enabled state after success')
+assert(modelNodes.some((n) => n.text.includes('does not send an image test request')), 'catalog identification is distinguished from a real image test')
+
+// A successful write with zero recognized models must describe that outcome.
+identifySummary = { image: 0, text: 0, unknown: 3, preserved: 0, updated: 0, catalogUnavailable: false }
+modelState = modelState.map(({ input: _input, ...m }) => m)
+buttonByText(modelNodes, 'identifyCapabilities').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.text.includes('0 text + image, 0 text only, 3 unconfirmed') && inlineStatus(modelNodes).text.includes('updated 0 models'), 'all-unknown zero-update outcome is visible rather than a generic total model count')
+
+identifySummary = { ...identifySummary, catalogUnavailable: true }
+buttonByText(modelNodes, 'identifyCapabilities').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes('temporarily unavailable. Try again later'), 'unavailable catalog shows a visible retry message')
+assert(!buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'catalog failure does not leave the button busy')
+
+// RPC failures must remain visible on the editor, whose parent dashboard is
+// replaced while selected. This reproduced the previously silent failure.
+identifyError = 'simulated identification failure'
+buttonByText(modelNodes, 'identifyCapabilities').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes(identifyError), 'identify business error is displayed in the current editor')
+assert(!buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'identify button restores enabled state after business failure')
+identifyError = ''
+
+providerRefreshError = 'simulated model refresh failure'
+buttonByText(modelNodes, 'identifyCapabilities').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.className.includes('mpro-inlineStatusErr') && inlineStatus(modelNodes).text.includes(providerRefreshError), 'refresh failure replaces summary with a visible editor error')
+assert(!buttonByText(modelNodes, 'identifyCapabilities').props.disabled, 'refresh failure does not leave the button busy')
+providerRefreshError = ''
+
+// Hosts without an identification summary can still show the freshly read
+// current capabilities, without inventing update counts or a live-test verdict.
+identifySummary = null
+modelState = modelState.map((m) => m.id === 'deepseek-chat' ? { ...m, input: ['text'] } : m.id === 'known-image-model' ? { ...m, input: ['text', 'image'] } : m)
+buttonByText(modelNodes, 'identifyCapabilities').onClick()
+await settle()
+modelNodes = renderModels()
+assert(inlineStatus(modelNodes)?.text.includes('Current list: 1 text + image, 1 text only, 1 unconfirmed') && !inlineStatus(modelNodes).text.includes('updated'), 'legacy response falls back to refreshed capability counts without claiming updates')
 
 // Remote badges also preserve the distinction between absent metadata and text.
 modelNodes = renderModels()

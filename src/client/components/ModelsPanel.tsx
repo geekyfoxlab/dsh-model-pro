@@ -4,7 +4,7 @@
  * custom-model add form. */
 
 import React from '../react'
-import type { ModelEntry, DiscoveredModel, InfoState, StatusMsg, TFunc, CallFn } from '../../shared/types'
+import type { ModelEntry, ModelCapabilitySummary, DiscoveredModel, InfoState, StatusMsg, TFunc, CallFn } from '../../shared/types'
 import { fmt } from '../labels'
 
 interface Props {
@@ -207,9 +207,21 @@ export function ModelsPanel({
     if (!curList.length || hasUnsavedConfig) return
     setBusy(true); setStatus(null)
     try {
-      const r = await call('apply-models', { route, models: curList, mode: 'merge' })
-      setStatus({ kind: 'ok', text: fmt(t('statusModels'), { count: r.count }) })
-      await refreshModels()
+      // 识别只发送 ID，避免把读取时附加的推断能力当成用户手动配置。
+      const r = await call('apply-models', { route, models: curList.map(({ id }) => ({ id })), mode: 'identify' })
+      const fresh = await refreshModels()
+      const summary = r.capabilitySummary as ModelCapabilitySummary | undefined
+      const counts = summary ?? fresh.reduce((sum, m) => {
+        if (m.input?.includes('image')) sum.image++
+        else if (m.input?.includes('text')) sum.text++
+        else sum.unknown++
+        return sum
+      }, { image: 0, text: 0, unknown: 0 })
+      const result = summary
+        ? fmt(t('statusCapabilities'), { image: summary.image, text: summary.text, unknown: summary.unknown, preserved: summary.preserved, updated: summary.updated })
+        : fmt(t('statusCapabilitiesCurrent'), { image: counts.image, text: counts.text, unknown: counts.unknown })
+      const hint = counts.unknown > 0 ? ` ${t('capabilitiesUnconfirmed')}` : ''
+      setStatus({ kind: summary?.catalogUnavailable ? 'err' : 'ok', text: `${summary?.catalogUnavailable ? `${t('capabilityCatalogUnavailable')} ` : ''}${result}${hint}` })
     } catch (e) { fail(e) } finally { setBusy(false) }
   }
 
