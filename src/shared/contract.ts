@@ -78,7 +78,8 @@ const argParam = {
   name: 'args',
   wire: 'args',
   source: 'json' as const,
-  codec: { mode: 'strict' as const, typeSymbol: `${PACKAGE}#Args`, schema: argsSchema },
+  // 新版 Typert 延迟创建 codec；保留 schema 以兼容旧版 Harness。
+  codec: { mode: 'strict' as const, typeSymbol: `${PACKAGE}#Args`, schema: argsSchema, create: () => argsSchema },
 }
 
 /** Strict invocation descriptors — what the client mounts and the host resolves. */
@@ -93,6 +94,7 @@ export const INVOCATIONS = METHODS.map(([, method]) => ({
     mode: 'strict' as const,
     typeSymbol: `${PACKAGE}#${method}Result`,
     schema: resultEnvelopeSchema,
+    create: () => resultEnvelopeSchema,
   },
 }))
 

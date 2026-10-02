@@ -13,14 +13,14 @@
  */
 
 import type { HostCtx } from './utils'
-import { readProviders, readDisabled, readProfile, makeHostPlain } from './utils'
+import { readProviders, readDisabled, readProfile, readRoutesRootKey, writeRoutesRootKey } from './utils'
 import { COMPOSITES_KEY, COMPOSITE_SEP, DEFAULT_ROUTE_STRATEGY } from '../shared/constants'
 import type { CompositesMap, CompositeSpec, RouteTarget } from '../shared/types'
 
 export function readComposites(ctx: HostCtx): CompositesMap {
   try {
     const st = ctx.get('settings')
-    const raw = st === undefined ? undefined : (st.get('llm-pi-ai') as Record<string, unknown> | undefined)?.[COMPOSITES_KEY]
+    const raw = readRoutesRootKey(st, COMPOSITES_KEY)
     const out: CompositesMap = {}
     if (raw && typeof raw === 'object') {
       for (const [name, v] of Object.entries(raw as Record<string, unknown>)) {
@@ -35,18 +35,7 @@ export function readComposites(ctx: HostCtx): CompositesMap {
 export async function writeComposites(ctx: HostCtx, map: CompositesMap): Promise<void> {
   const st = ctx.get('settings')
   if (st === undefined) throw new Error('settings 服务不可用')
-  const preserved: Record<string, unknown> = {}
-  try {
-    const section = st.get('llm-pi-ai') as Record<string, unknown> | undefined
-    if (section && typeof section === 'object') {
-      for (const k of Object.keys(section)) {
-        if (k === COMPOSITES_KEY) continue
-        preserved[k] = section[k]
-      }
-    }
-  } catch { /* nothing to preserve */ }
-  // Reuse the null-proto rebuild helper from utils.
-  await st.replace('llm-pi-ai', makeHostPlain({ ...preserved, [COMPOSITES_KEY]: map }) as any)
+  await writeRoutesRootKey(st, COMPOSITES_KEY, map)
 }
 
 function normalizeComposite(raw: unknown): CompositeSpec | null {

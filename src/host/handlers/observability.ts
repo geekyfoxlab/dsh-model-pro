@@ -11,7 +11,7 @@
 
 import type { HostCtx } from '../utils'
 import { getLogRing, getStatsRecorder, persistStats } from '../statsStore'
-import { readProviders, readDisabled } from '../utils'
+import { readProviders, readDisabled, readSection } from '../utils'
 import { getHealthTracker } from '../health'
 
 /** Recursively drop `undefined` values (arrays/objects) so the result is
@@ -155,7 +155,7 @@ export async function probeAll(ctx: HostCtx) {
 function collectProbeTargets(ctx: HostCtx): Array<{ provider: string; model: string }> {
   const out: Array<{ provider: string; model: string }> = []
   const st = ctx.get('settings')
-  const section = (st?.get('llm-pi-ai') as Record<string, unknown> | undefined) || {}
+  const section = (st === undefined ? undefined : readSection(st)) || {}
   const routesRaw = section.routes as Record<string, { targets?: Array<{ provider: string; model: string }> }> | undefined
   if (routesRaw && typeof routesRaw === 'object') {
     for (const spec of Object.values(routesRaw)) {

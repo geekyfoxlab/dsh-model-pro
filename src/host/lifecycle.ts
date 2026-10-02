@@ -12,7 +12,7 @@
  */
 
 import type { HostCtx } from './utils'
-import { readProviders, readDisabled, checkWritable, writeSection } from './utils'
+import { readProviders, readDisabled, checkWritable, writeSection, restoreModernProviders } from './utils'
 
 /**
  * On unload (uninstall / disable of this plugin): every parked provider is
@@ -55,7 +55,8 @@ export async function restoreDisabledOnUnload(ctx: HostCtx) {
   if (restored === 0) return { restored: 0, skipped }
 
   try {
-    await writeSection(st, nextProviders as any, nextDisabled as any)
+    if (typeof st.get !== 'function') await restoreModernProviders(st, nextProviders as any)
+    else await writeSection(st, nextProviders as any, nextDisabled as any)
   } catch (err) {
     try {
       ;(ctx.get('logger') as any)?.warn?.(`dsh-model-pro: 卸载还原失败 — ${String((err as Error)?.message || err)}`)

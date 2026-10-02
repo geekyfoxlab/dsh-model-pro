@@ -15,6 +15,11 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import vm from 'node:vm'
+import { createRequire } from 'node:module'
+import assertStrict from 'node:assert/strict'
+
+const require = createRequire(import.meta.url)
+const z = require('@deepseek-ai/schemastery')
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const HOST_BUNDLE = path.join(__dirname, '..', 'dist', 'host.js')
@@ -141,11 +146,12 @@ async function loadHost() {
   let code = readFileSync(HOST_BUNDLE, 'utf8')
   // Strip the ESM import (stubbed below) and the trailing `export { ... }`.
   code = code.replace(/^\s*import\s+\{[^}]*\}\s+from\s+["']@deepseek-ai\/dsh-typert-protocol["'];?/m, '')
+  code = code.replace(/^\s*import\s+z\s+from\s+["']@deepseek-ai\/schemastery["'];?/m, '')
   code = code.replace(/export\s*\{[\s\S]*?\};?\s*$/m, '')
 
   const captured = []
   const sandbox = {
-    console, setTimeout, clearTimeout, Date, Promise, AbortController,
+    console, setTimeout, clearTimeout, Date, Promise, AbortController, z,
     TextEncoder, TextDecoder,
     // stub base: capture each runtime instance so the test can invoke methods
     TypertRemoteService: class {
@@ -154,11 +160,11 @@ async function loadHost() {
   }
   sandbox.globalThis = sandbox
   const result = await vm.runInContext(
-    `(async () => { ${code}\n; return { apply, name, inject }; })()`,
+    `(async () => { ${code}\n; return { apply, name, inject, Config, TYPERT_MANIFEST }; })()`,
     vm.createContext(sandbox),
     { filename: 'model-pro-host.js' },
   )
-  return { apply: result.apply, runtimes: captured }
+  return { apply: result.apply, runtimes: captured, Config: result.Config, manifest: result.TYPERT_MANIFEST }
 }
 
 function assert(cond, msg) {
@@ -914,4 +920,204 @@ await P('delete-provider', { route: 'comp-b' })
   assert(provs()['unl-gw'] && !Object.hasOwn(dis(), 'unl-gw'), 'uninstall-restore is NOT undone by a late settings/updated re-park')
 }
 
-console.log('PASS: host end-to-end smoke — all assertions green')
+// ---------------------------------------------------------------------------
+// Harness 0.2: describe()/mutate(), namespace ownership and revision checking.
+// 保留上面的旧接口覆盖；这里完全没有 get()，避免新接口退化时被旧 mock 掩盖。
+// ---------------------------------------------------------------------------
+{
+  const initialProvider = {
+    api: 'openai-completions', baseURL: 'https://existing.invalid/v1',
+    models: [{ id: 'original' }], headers: { 'X-Preserve': 'yes' }, apiKeyEnv: 'EXISTING_KEY',
+  }
+  const persistedStats = { calls: 4, errors: 0, latencySum: 20, latencyN: 4, tokensIn: 8, tokensOut: 12 }
+  const documents = new Map([
+    ['llm-pi-ai', { revision: 0, value: { providers: {
+      existing: initialProvider,
+      'marked-before-ready': { baseURL: 'https://marked.invalid/v1', models: [{ id: 'marked' }], disabled: true },
+    } } }],
+    ['dsh-model-pro', { revision: 0, value: { state: {
+      disabledProviders: {}, extensionNote: 'preserved',
+      routeStats: { byTarget: { ['existing\u0000original']: persistedStats }, byRoute: {}, health: {},
+        logs: [{ ts: 1, route: 'prior-modern-route', target: { provider: 'existing', model: 'original' }, status: 'ok', tryIndex: 1, latencyMs: 5, tokens: {} }],
+      },
+    } } }],
+  ])
+  const writes = []
+  const modernListeners = new Map()
+  let ownRegistered = false
+  let llmRegistered = true
+  let nextProviderFailure = false
+  let nextProviderConflict = false
+  const freeze = (value) => {
+    if (value && typeof value === 'object') {
+      for (const child of Object.values(value)) freeze(child)
+      Object.freeze(value)
+    }
+    return value
+  }
+  const plain = (value) => {
+    if (value === null || typeof value !== 'object') return
+    if (!Array.isArray(value)) {
+      const proto = Object.getPrototypeOf(value)
+      assert(proto === null || proto === Object.prototype, 'modern writes use host-realm plain objects')
+    }
+    for (const child of Object.values(value)) plain(child)
+  }
+  const fire = (ns) => {
+    for (const listener of modernListeners.get('settings/document-updated') || []) listener(ns, documents.get(ns).revision)
+  }
+  const modernStore = {
+    writable: true,
+    describe: () => [...documents].filter(([ns]) => ns === 'llm-pi-ai' ? llmRegistered : ownRegistered)
+      .map(([ns, entry]) => ({ ns, revision: entry.revision, value: freeze(structuredClone(entry.value)) })),
+    async mutate(ns, ops, expectedRevision) {
+      const entry = documents.get(ns)
+      assert(entry && (ns === 'llm-pi-ai' ? llmRegistered : ownRegistered), 'mutate requires a mounted namespace')
+      if (ns === 'llm-pi-ai' && nextProviderConflict) { nextProviderConflict = false; entry.revision++ }
+      if (expectedRevision !== entry.revision) throw new Error('settings revision conflict')
+      if (ns === 'llm-pi-ai' && nextProviderFailure) { nextProviderFailure = false; throw new Error('injected provider write failure') }
+      const next = structuredClone(entry.value)
+      for (const op of ops) {
+        assert(op.op === 'set', 'modern test only supports set operations')
+        assert(ns === 'llm-pi-ai' ? op.path.length === 1 && op.path[0] === 'providers'
+          : op.path.length === 2 && op.path[0] === 'state', 'modern write stays within namespace volatile fields')
+        plain(op.value)
+        let target = next
+        for (const key of op.path.slice(0, -1)) target = target[key]
+        target[op.path.at(-1)] = structuredClone(op.value)
+      }
+      writes.push({ ns, paths: ops.map((op) => op.path), expectedRevision })
+      entry.value = next
+      entry.revision++
+      queueMicrotask(() => fire(ns))
+    },
+    async replace() { throw new Error('modern provider operations must use mutate()') },
+  }
+  const doc = (ns = 'llm-pi-ai') => documents.get(ns).value
+  const active = () => doc().providers
+  const parked = () => doc('dsh-model-pro').state.disabledProviders
+  const modernSecrets = new Map([['EXISTING_KEY', 'synthetic-existing-secret']])
+  const modernLog = { section: () => doc() }
+  const modernLlm = createLlm(modernLog)
+  const modernCleanups = []
+  const modernTimers = []
+  const modernCtx = {
+    get: (name) => name === 'settings' ? modernStore : name === 'llm' ? modernLlm
+      : name === 'credentials' ? {
+        resolve: async (ref) => ({ value: modernSecrets.get(ref) }),
+        set: async (ref, value) => modernSecrets.set(ref, value),
+        unset: async (ref) => modernSecrets.delete(ref),
+      } : name === 'timer' ? {
+        interval: (fn) => { modernTimers.push(fn); return () => {} },
+      } : undefined,
+    typert: { register: () => () => {} },
+    on: (event, listener) => {
+      const group = modernListeners.get(event) || []
+      group.push(listener)
+      modernListeners.set(event, group)
+      return () => group.splice(group.indexOf(listener), 1)
+    },
+    effect: (fn) => { const cleanup = fn(); if (typeof cleanup === 'function') modernCleanups.push(cleanup) },
+  }
+  const modernHost = await loadHost()
+  assertStrict.deepEqual(JSON.parse(JSON.stringify(modernHost.Config({}))), { state: {} })
+  for (const invocation of modernHost.manifest.invocations) {
+    const args = invocation.parameters[0].codec
+    const result = invocation.result
+    assert(typeof args.create === 'function' && typeof result.create === 'function', 'all RPC codecs expose modern factories')
+    assertStrict.throws(() => args.create().parse([]), /args object/)
+    assertStrict.throws(() => result.create().parse({}), /envelope/)
+    assert(args.schema.parse({ route: 'test' }).route === 'test', 'legacy args schema retained')
+    assert(result.create().parse({ ok: true }).ok, 'modern result codec accepts successful envelopes')
+    assert(result.schema.parse({ ok: false, error: 'test' }).ok === false, 'legacy result schema retained')
+  }
+  const rpc = (method, args = {}) => modernHost.runtimes.at(-1)[kebabToCamel(method)](args)
+  const original = JSON.stringify(active().existing)
+  modernHost.apply(modernCtx)
+  await Promise.resolve()
+  assert(active()['marked-before-ready'] && !parked()['marked-before-ready'], 'modern startup waits until its own settings form is mounted')
+  assert(!(await rpc('get-route-stats')).byTarget['existing\u0000original'], 'unmounted own form has not exposed the persisted stats')
+  ownRegistered = true
+  fire('dsh-model-pro')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert(!active()['marked-before-ready'] && parked()['marked-before-ready'], 'own-form document-updated event reparks startup markers')
+  assert((await rpc('get-route-stats')).byTarget['existing\u0000original']?.calls === 4, 'own-form readiness hydrates persisted stats')
+  assert((await rpc('list-request-logs')).entries.some((entry) => entry.route === 'prior-modern-route'), 'own-form readiness hydrates persisted logs')
+  r = await rpc('list-providers')
+  assert(r.ok && r.providers.some((provider) => provider.route === 'existing'), 'modern describe reads pre-existing providers')
+  r = await rpc('create-provider', { route: 'modern-gw', baseURL: 'https://modern.invalid/v1' })
+  assert(r.ok && active()['modern-gw'], 'modern provider creation persists: ' + JSON.stringify(r))
+  r = await rpc('update-field', { route: 'modern-gw', field: 'displayName', value: 'Updated gateway' })
+  assert(r.ok && active()['modern-gw'].displayName === 'Updated gateway', 'modern field editing persists')
+  r = await rpc('update-headers', { route: 'modern-gw', headers: [{ name: 'X-Modern', value: 'yes' }] })
+  assert(r.ok && active()['modern-gw'].headers['X-Modern'] === 'yes', 'modern header editing persists')
+  r = await rpc('apply-models', { route: 'modern-gw', models: [{ id: 'chosen', requestModel: 'wire' }], mode: 'replace' })
+  assert(r.ok && active()['modern-gw'].models[0].requestModel === 'wire', 'modern model editing persists')
+  r = await rpc('set-api-key', { route: 'modern-gw', apiKey: 'synthetic-modern-secret' })
+  assert(r.ok && !JSON.stringify([...documents]).includes('synthetic-modern-secret'), 'modern secret remains outside settings plaintext')
+  r = await rpc('get-provider', { route: 'modern-gw', includeSecret: true })
+  assert(r.ok && r.secret === 'synthetic-modern-secret', 'modern encrypted secret round trip')
+  for (const enabled of [false, true, false, true]) {
+    r = await rpc('toggle-provider', { route: 'modern-gw', enabled })
+    assert(r.ok && !!active()['modern-gw'] === enabled && !!parked()['modern-gw'] === !enabled, 'modern toggle updates separate namespaces')
+  }
+  r = await rpc('set-route', { alias: 'modern-auto', strategy: 'priority', targets: [{ provider: 'modern-gw', model: 'chosen' }] })
+  assert(r.ok && doc('dsh-model-pro').state.routes['modern-auto'], 'modern route belongs to model-pro state')
+  r = await rpc('set-composite', { name: 'modern-mix', members: ['existing', 'modern-gw'], mode: 'union' })
+  assert(r.ok && doc('dsh-model-pro').state.composites['modern-mix'], 'modern composite belongs to model-pro state')
+  r = await rpc('preview-composite', { name: 'modern-mix' })
+  assert(r.ok && r.ids.includes('original') && r.ids.includes('chosen'), 'modern composite reads actual provider models')
+  r = await rpc('set-ui-prefs', { prefs: { showRouteBadge: false } })
+  assert(r.ok && (await rpc('get-ui-prefs')).prefs.showRouteBadge === false, 'modern UI prefs persist in owned state')
+  assert(doc('dsh-model-pro').state.routes['modern-auto'], 'modern prefs preserve sibling route state')
+
+  const modernRouter = modernLlm.registrations.find((registration) => registration.providers.includes('router'))
+  for await (const chunk of modernRouter.adapter.stream({ provider: 'router', model: 'modern-auto', messages: [] })) { /* drain */ }
+  for (const callback of modernTimers) await callback()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert(doc('dsh-model-pro').state.routeStats, 'modern routing stats persist in owned state')
+  assert(modernLog.lastConfig.provider === 'modern-gw', 'modern router forwards to configured provider')
+
+  // 外部写入改变 revision 或持久化失败时，不能把启用中的供应商遗失。
+  for (const failure of ['conflict', 'write']) {
+    if (failure === 'conflict') nextProviderConflict = true
+    else nextProviderFailure = true
+    r = await rpc('toggle-provider', { route: 'modern-gw', enabled: false })
+    assert(!r.ok && active()['modern-gw'] && !parked()['modern-gw'], 'modern failed toggle preserves provider and rolls back parked state: ' + failure)
+  }
+  await assertStrict.rejects(modernStore.mutate('llm-pi-ai', [{ op: 'set', path: ['providers'], value: {} }], -1), /revision conflict/)
+  await rpc('toggle-provider', { route: 'modern-gw', enabled: false })
+  r = await rpc('update-headers', { route: 'modern-gw', headers: [{ name: 'X-Modern', value: 'edited while disabled' }] })
+  assert(r.ok && parked()['modern-gw'].headers['X-Modern'] === 'edited while disabled', 'modern disabled provider remains editable')
+
+  // 卸载时自身表单先撤下，仍须通过缓存还原；重装继续保持用户禁用选择。
+  ownRegistered = false
+  for (const cleanup of modernCleanups.splice(0).reverse()) await cleanup()
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert(active()['modern-gw']?.disabled === true, 'modern unload restores disabled provider with marker')
+  assert(active()['modern-gw'].headers['X-Modern'] === 'edited while disabled', 'modern unload preserves complete provider data')
+  ownRegistered = true
+  llmRegistered = false
+  modernHost.apply(modernCtx)
+  await Promise.resolve()
+  assert(active()['modern-gw'], 'modern reinstall waits while llm namespace is unmounted')
+  llmRegistered = true
+  fire('llm-pi-ai')
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert(!active()['modern-gw'] && parked()['modern-gw'], 'modern document-updated event reparks after late llm registration')
+  await rpc('toggle-provider', { route: 'modern-gw', enabled: true })
+  r = await rpc('delete-provider', { route: 'modern-gw' })
+  assert(r.ok && !active()['modern-gw'] && !parked()['modern-gw'], 'modern provider deletion removes both copies')
+  r = await rpc('delete-route', { alias: 'modern-auto' })
+  assert(r.ok && !(await rpc('list-routes')).routes['modern-auto'], 'modern route deletion persists')
+  r = await rpc('delete-composite', { name: 'modern-mix' })
+  assert(r.ok && !(await rpc('list-composites')).composites['modern-mix'], 'modern composite deletion persists')
+  assert(JSON.stringify(active().existing) === original, 'modern writes preserve pre-existing provider byte for byte')
+  assert(modernSecrets.get('EXISTING_KEY') === 'synthetic-existing-secret', 'modern writes preserve unrelated credentials')
+  assert(doc('dsh-model-pro').state.extensionNote === 'preserved', 'modern writes preserve other owned-state fields')
+  assertStrict.deepEqual(Object.keys(doc()), ['providers'])
+  assert(writes.some((write) => write.ns === 'llm-pi-ai') && writes.some((write) => write.ns === 'dsh-model-pro'), 'modern writes address each schema namespace')
+  for (const cleanup of modernCleanups.splice(0).reverse()) await cleanup()
+}
+
+console.log('PASS: host end-to-end smoke — legacy and Harness 0.2 assertions green')

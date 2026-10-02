@@ -147,9 +147,9 @@ dsh plugin --profile web remove dsh-model-pro
 ## 🔍 工作原理
 
 ### 禁用 & 卸载还原
-禁用会把提供商配置从 `llm-pi-ai.providers` 移入 `llm-pi-ai.disabledProviders`。由于 `llm-pi-ai` 适配器只解析 `providers` 字典，被禁用的提供商会从模型选择器中消失；schemastery 的非严格对象解析器会在设置校验中保留这个未知键。
+禁用会把提供商配置从 `llm-pi-ai.providers` 移入禁用档案。Harness 0.2 将禁用档案保存在 `dsh-model-pro.state.disabledProviders`，路由、组合、界面偏好和观测快照也由本插件的 volatile 配置字段持有；旧版 Harness 保留 `llm-pi-ai.disabledProviders` 的存储方式。由于 `llm-pi-ai` 适配器只解析 `providers` 字典，被禁用的提供商会从模型选择器中消失。兼容接口和测试说明见 [Harness 0.2 兼容性](docs/harness-0.2-compat.md)。
 
-因为 `disabledProviders` 是 schema 外来键，Host 半在 fiber 清理时（插件被卸载**或**禁用）执行禁用操作的逆运算：把每个被禁用的提供商连同完整档案还原回 `providers`。启用中的提供商不受影响。
+Host 半在 fiber 清理时（插件被卸载**或**禁用）执行禁用操作的逆运算：把每个被禁用的提供商连同完整档案还原回 `providers`。启用中的提供商不受影响。
 
 ### 密钥加密
 提供商 API Key 存于两处：**权威副本**在 DSH `credentials` 服务（`llm-pi-ai` 请求时解析）；**静态快照**为 `profile.apiKeyEnc` 下的 AES-256-GCM 密文。随机 AES 主密钥仅生成一次并存入凭据服务，**永不重新生成**，保证重装后旧密文仍可解密。沙箱缺少 WebCrypto 时回退到打包的纯 JS `@noble/ciphers`。

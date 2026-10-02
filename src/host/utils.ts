@@ -9,13 +9,66 @@
  */
 
 import { NS, ROUTES_KEY } from '../shared/constants'
+import { PACKAGE } from '../shared/contract'
 import type { ProviderProfile, RoutesMap } from '../shared/types'
 
 /** Settings service interface (subset we use) */
 export interface SettingsService {
-  get(ns: string): Record<string, unknown> | undefined
+  get?(ns: string): Record<string, unknown> | undefined
+  describe?(): SettingsDescriptor[]
+  mutate?(ns: string, ops: SettingsOp[], expectedRevision?: number): Promise<void>
   readonly writable: boolean
-  replace(ns: string, section: unknown): Promise<void>
+  replace(ns: string, section: unknown, expectedRevision?: number): Promise<void>
+}
+
+interface SettingsDescriptor {
+  ns: string
+  revision: number
+  value: Record<string, unknown>
+}
+interface SettingsOp {
+  op: 'set'
+  path: string[]
+  value: unknown
+}
+
+const ownedStates = new WeakMap<SettingsService, Record<string, unknown>>()
+
+/** 新旧配置服务的读取入口；新版从未脱敏的 Host 表单值读取。 */
+export function readSection(st: SettingsService, ns = NS): Record<string, unknown> | undefined {
+  if (typeof st.get === 'function') return st.get(ns)
+  if (typeof st.describe !== 'function') throw new Error('不支持当前 Harness 配置读取接口')
+  const value = st.describe().find((row) => row.ns === ns)?.value
+  if (ns !== NS || value === undefined) return value
+  const current = st.describe().find((row) => row.ns === PACKAGE)?.value.state
+  if (isRecord(current)) ownedStates.set(st, current)
+  // 清理阶段插件表单已撤下；最后一份状态仍用于把禁用供应商还原。
+  const owned = isRecord(current) ? current : ownedStates.get(st)
+  return { ...(isRecord(owned) ? owned : {}), ...value }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function requireDescriptor(st: SettingsService, ns: string): SettingsDescriptor {
+  const descriptor = st.describe?.().find((row) => row.ns === ns)
+  if (descriptor === undefined) throw new Error(`配置项 ${ns} 尚未就绪，请刷新后重试`)
+  return descriptor
+}
+
+async function writeOwnedKey(st: SettingsService, key: string, value: unknown): Promise<void> {
+  const descriptor = requireDescriptor(st, PACKAGE)
+  if (typeof st.mutate !== 'function') throw new Error('不支持当前 Harness 配置写入接口')
+  await st.mutate(PACKAGE, [{ op: 'set', path: ['state', key], value: makeHostPlain({ value }).value }], descriptor.revision)
+  ownedStates.set(st, { ...(isRecord(descriptor.value.state) ? descriptor.value.state : {}), [key]: value })
+}
+
+/** 插件卸载时只还原适配器；保留插件档案中的备份，供重装恢复禁用状态。 */
+export async function restoreModernProviders(st: SettingsService, providers: Record<string, ProviderProfile>): Promise<void> {
+  const descriptor = requireDescriptor(st, NS)
+  if (typeof st.mutate !== 'function') throw new Error('不支持当前 Harness 配置写入接口')
+  await st.mutate(NS, [{ op: 'set', path: ['providers'], value: makeHostPlain(providers) }], descriptor.revision)
 }
 
 /** LLM service interface (subset we use) */
@@ -68,7 +121,7 @@ export function makeHostPlain(obj: Record<string, unknown>): Record<string, null
 export function readProviders(st: SettingsService | undefined): Record<string, ProviderProfile> {
   if (st === undefined) return {}
   try {
-    const section = st.get(NS)
+    const section = readSection(st)
     if (section && typeof section === 'object' && (section as any).providers && typeof (section as any).providers === 'object')
       return (section as any).providers as Record<string, ProviderProfile>
   } catch { /* ignore */ }
@@ -79,7 +132,7 @@ export function readProviders(st: SettingsService | undefined): Record<string, P
 export function readDisabled(st: SettingsService | undefined): Record<string, ProviderProfile> {
   if (st === undefined) return {}
   try {
-    const section = st.get(NS)
+    const section = readSection(st)
     if (section && typeof section === 'object' && (section as any).disabledProviders && typeof (section as any).disabledProviders === 'object')
       return (section as any).disabledProviders as Record<string, ProviderProfile>
   } catch { /* ignore */ }
@@ -103,7 +156,7 @@ export function readProfile(
 export function readRoutes(st: SettingsService | undefined): RoutesMap {
   if (st === undefined) return {}
   try {
-    const section = st.get(NS) as Record<string, unknown> | undefined
+    const section = readSection(st)
     const r = section && section[ROUTES_KEY]
     if (r && typeof r === 'object') return { ...(r as RoutesMap) }
   } catch { /* ignore */ }
@@ -112,9 +165,10 @@ export function readRoutes(st: SettingsService | undefined): RoutesMap {
 
 /** Write the smart-routing alias table, preserving every other section key. */
 export async function writeRoutes(st: SettingsService, routes: RoutesMap): Promise<void> {
+  if (typeof st.get !== 'function') return writeOwnedKey(st, ROUTES_KEY, routes)
   const preserved: Record<string, unknown> = {}
   try {
-    const section = st.get(NS) as Record<string, unknown> | undefined
+    const section = readSection(st)
     if (section && typeof section === 'object') {
       for (const k of Object.keys(section)) {
         if (k === ROUTES_KEY) continue
@@ -130,7 +184,7 @@ export async function writeRoutes(st: SettingsService, routes: RoutesMap): Promi
 export function readRoutesRootKey(st: SettingsService | undefined, key: string): unknown {
   if (st === undefined) return undefined
   try {
-    const section = st.get(NS) as Record<string, unknown> | undefined
+    const section = readSection(st)
     const v = section && section[key]
     if (v && typeof v === 'object') return { ...(v as Record<string, unknown>) }
     return v
@@ -141,9 +195,10 @@ export function readRoutesRootKey(st: SettingsService | undefined, key: string):
 /** Write a top-level key in the llm-pi-ai section, preserving every other key. */
 export async function writeRoutesRootKey(st: SettingsService | undefined, key: string, value: unknown): Promise<void> {
   if (st === undefined) return
+  if (typeof st.get !== 'function') return writeOwnedKey(st, key, value)
   const preserved: Record<string, unknown> = {}
   try {
-    const section = st.get(NS) as Record<string, unknown> | undefined
+    const section = readSection(st)
     if (section && typeof section === 'object') {
       for (const k of Object.keys(section)) {
         if (k === key) continue
@@ -194,9 +249,27 @@ export async function writeSection(
   providers: Record<string, ProviderProfile>,
   disabled: Record<string, ProviderProfile>,
 ): Promise<void> {
+  if (typeof st.get !== 'function') {
+    const descriptor = requireDescriptor(st, NS)
+    if (typeof st.mutate !== 'function') throw new Error('不支持当前 Harness 配置写入接口')
+    const previousDisabled = readDisabled(st)
+    const disabledChanged = JSON.stringify(previousDisabled) !== JSON.stringify(disabled)
+    // 先保存将被移出的配置；任一步失败都保留至少一份供应商数据。
+    if (disabledChanged) await writeOwnedKey(st, 'disabledProviders', { ...previousDisabled, ...disabled })
+    try {
+      await st.mutate(NS, [{ op: 'set', path: ['providers'], value: makeHostPlain(providers) }], descriptor.revision)
+    } catch (error) {
+      if (disabledChanged) {
+        try { await writeOwnedKey(st, 'disabledProviders', previousDisabled) } catch { /* 保留备份供重试 */ }
+      }
+      throw error
+    }
+    if (disabledChanged) await writeOwnedKey(st, 'disabledProviders', disabled)
+    return
+  }
   const preserved: Record<string, unknown> = {}
   try {
-    const section = st.get(NS) as Record<string, unknown> | undefined
+    const section = readSection(st)
     if (section && typeof section === 'object') {
       for (const k of Object.keys(section)) {
         if (k === 'providers' || k === 'disabledProviders') continue
